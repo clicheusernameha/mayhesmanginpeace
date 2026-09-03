@@ -1,4 +1,5 @@
 import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
+import { encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 
 // claub-autoresponder — the thing that lets @claub answer on its own, on Val Town.
 // ---------------------------------------------------------------------------
@@ -123,7 +124,7 @@ async function mark(key: string, conversationId: string, role: string, content: 
 }
 
 // One model call, returns the reply text (or "" on refusal/empty/error).
-async function askClaude(system: string, messages: { role: string; content: string }[]): Promise<string> {
+async function askClaude(system: string, messages: { role: string; content: any }[]): Promise<string> {
   const res = await fetch("https://api.anthropic.com/v1/messages", {
     method: "POST",
     headers: {
@@ -145,6 +146,94 @@ async function askClaude(system: string, messages: { role: string; content: stri
     .trim();
 }
 
+// ---- Seeing images: turn iMessage attachments into vision blocks ------------
+// Kim can text photos; Claude (sonnet-5) can see them — but only if we hand
+// them over as image blocks. Inkbox's exact attachment field names aren't
+// pinned down here (their docs are behind a wall we can't reach), so this reads
+// defensively across the likely names AND logs the raw shape the first time a
+// photo shows up — so a real image tells us the truth and we tighten later.
+// We download the bytes ourselves and inline them as base64: that works even
+// if the URL is signed, expiring, or needs the Inkbox key — no dependence on
+// the image being publicly reachable by Anthropic.
+
+const SUPPORTED_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/gif", "image/webp"]);
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024; // Anthropic's per-image base64 ceiling
+
+function extractAttachments(message: any, event?: any): any[] {
+  const raw =
+    message?.attachments ?? message?.media ?? message?.files ?? message?.attachment ??
+    event?.data?.attachments ?? event?.attachments ?? [];
+  return (Array.isArray(raw) ? raw : [raw]).filter(Boolean);
+}
+function attUrl(a: any): string | undefined {
+  if (typeof a === "string") return a;
+  return a?.url ?? a?.href ?? a?.download_url ?? a?.downloadUrl ?? a?.data_url ?? a?.src ?? a?.uri;
+}
+function attType(a: any): string {
+  return (a?.media_type ?? a?.mime_type ?? a?.mimeType ?? a?.content_type ?? a?.contentType ?? a?.type ?? "")
+    .toString().toLowerCase().split(";")[0].trim();
+}
+function attInlineData(a: any): string | undefined {
+  // Already-inline base64 (not a URL). Length guard so we don't grab a tiny id field.
+  return typeof a?.data === "string" && a.data.length > 100 && !a.data.startsWith("http") ? a.data : undefined;
+}
+function typeFromUrl(url: string): string {
+  const u = url.toLowerCase();
+  if (/\.jpe?g(\?|#|$)/.test(u)) return "image/jpeg";
+  if (/\.png(\?|#|$)/.test(u)) return "image/png";
+  if (/\.gif(\?|#|$)/.test(u)) return "image/gif";
+  if (/\.webp(\?|#|$)/.test(u)) return "image/webp";
+  if (/\.hei[cf](\?|#|$)/.test(u)) return "image/heic";
+  return "";
+}
+
+// Returns image blocks Claude can see, plus human-readable notes for anything
+// we had to skip (HEIC from iPhones, non-image files, failed downloads) so the
+// reply can acknowledge them instead of pretending nothing was sent.
+async function imageBlocksFor(message: any, event?: any): Promise<{ blocks: any[]; notes: string[] }> {
+  const atts = extractAttachments(message, event);
+  if (atts.length) console.log("[claub] attachments seen:", JSON.stringify(atts).slice(0, 800));
+
+  const blocks: any[] = [];
+  const notes: string[] = [];
+
+  for (const a of atts) {
+    let mediaType = attType(a);
+    let data = attInlineData(a);
+    const url = attUrl(a);
+
+    if (!data && url) {
+      if (!mediaType) mediaType = typeFromUrl(url);
+      try {
+        const r = await fetch(url, { headers: { "x-api-key": inkboxKey() } });
+        if (!r.ok) { notes.push("[an image was sent but couldn't be downloaded]"); continue; }
+        if (!mediaType) mediaType = (r.headers.get("content-type") ?? "").toLowerCase().split(";")[0].trim();
+        const bytes = new Uint8Array(await r.arrayBuffer());
+        if (bytes.byteLength > MAX_IMAGE_BYTES) { notes.push("[an image was too large to include]"); continue; }
+        data = encodeBase64(bytes);
+      } catch (_) {
+        notes.push("[an image was sent but couldn't be downloaded]");
+        continue;
+      }
+    }
+
+    if (!data) continue; // nothing we can turn into pixels
+    if (!SUPPORTED_IMAGE_TYPES.has(mediaType)) {
+      // iPhone photos often arrive as HEIC, which Claude can't read. Name it so
+      // the reply can say "resend as a screenshot" instead of going blind.
+      notes.push(
+        mediaType.startsWith("image/")
+          ? `[an image was sent in ${mediaType} format, which Claude can't view — iPhone HEIC does this; a screenshot comes through as PNG]`
+          : `[a ${mediaType || "file"} attachment was sent, which can't be viewed as an image]`,
+      );
+      continue;
+    }
+    blocks.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
+  }
+
+  return { blocks, notes };
+}
+
 // ---- Job 1: iMessage from Kim ----------------------------------------------
 
 async function handleImessage(event: any) {
@@ -152,19 +241,39 @@ async function handleImessage(event: any) {
   const text = (message?.content ?? "").toString();
   const conversationId = message?.conversation_id;
   const messageId = (message?.id ?? event?.id ?? crypto.randomUUID()).toString();
-  if (!conversationId || !text.trim()) return;
+  if (!conversationId) return;
+
+  // Pull any photos out of the webhook and turn them into blocks Claude can see.
+  const { blocks: imageBlocks, notes } = await imageBlocksFor(message, event);
+  const hasImages = imageBlocks.length > 0;
+  // Only bail if there's nothing to answer at all — no text, no viewable image,
+  // and nothing even to acknowledge. (An image-only text used to return here and
+  // go silent, because the old guard required non-empty text.)
+  if (!text.trim() && !hasImages && notes.length === 0) return;
 
   await ensureTable();
   if (await seen(`reply-${messageId}`)) return; // already answered this one
 
-  await mark(messageId, conversationId, "user", text); // store inbound (idempotent)
+  // History is text-only by design (SQLite holds text; image URLs expire), so an
+  // image-only message is stored as a placeholder for continuity. The actual
+  // pixels ride on the CURRENT turn below, not on stored history.
+  const stored = text.trim() || (hasImages ? "[sent an image]" : notes.join(" ")) || "[sent an attachment]";
+  await mark(messageId, conversationId, "user", stored);
 
   const history = await sqlite.execute({
     sql: `SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?`,
     args: [conversationId, HISTORY_LIMIT],
   });
-  const turns = history.rows.map((r: any) => ({ role: r.role, content: r.content })).reverse();
+  const turns: { role: string; content: any }[] =
+    history.rows.map((r: any) => ({ role: r.role, content: r.content })).reverse();
   while (turns.length && turns[0].role !== "user") turns.shift();
+
+  // Hand the current message's images to Claude by replacing the last user
+  // turn's text with [images..., caption]. Only this turn carries pixels.
+  if ((hasImages || notes.length) && turns.length) {
+    const caption = [text.trim(), ...notes].filter(Boolean).join("\n") || "(image, no caption)";
+    turns[turns.length - 1].content = [...imageBlocks, { type: "text", text: caption }];
+  }
 
   const reply = await askClaude(SYSTEM, turns);
   if (!reply) return;

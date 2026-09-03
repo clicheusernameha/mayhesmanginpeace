@@ -49,6 +49,36 @@ can't double-text.
 Nothing else is required. (There's no webhook setting to change — memory lives
 in the database here, not in the webhook.)
 
+## Seeing photos (images over text)
+
+Kim can text @claub a photo and he can actually **look at it** now — Claude
+(sonnet-5) has vision, so the only trick was handing the image over instead of
+throwing it away. The old code read `message.content` (text) and ignored
+everything else; now it pulls attachments out of the webhook, downloads the
+bytes, and passes them to Claude as image blocks alongside whatever Kim typed.
+
+A few things worth knowing:
+
+- **Only the *current* photo is seen.** Memory is text-only (SQLite holds text,
+  and image URLs expire), so past photos show up in history as `[sent an image]`
+  and only the photo in the newest message is actually looked at. That's a
+  deliberate, cheap-and-simple choice, not a bug.
+- **iPhone HEIC won't render.** Claude reads JPEG/PNG/GIF/WebP. iPhones often
+  send photos as **HEIC**, which can't be viewed — @claub will *say so* and ask
+  for a screenshot (screenshots come through as PNG) rather than going blind and
+  pretending. If most real photos turn out HEIC, the next step is converting
+  them server-side before sending.
+- **We're guessing Inkbox's field names.** Their webhook docs are behind a wall
+  the build tool can't reach, so the attachment reader checks the likely names
+  (`attachments`, `media`, `files`, …) *and logs the raw shape* the first time a
+  real photo arrives. If images don't come through, open the val's logs and look
+  for `[claub] attachments seen:` — that line shows the true shape, and
+  `extractAttachments` / `attUrl` / `attType` at the top of the vision section
+  are the three spots to adjust to match it.
+
+Redeploy is the same as always (select-all, paste, save). Test by texting a
+screenshot first (guaranteed PNG), then a normal photo.
+
 ## Knobs you might touch
 
 - **`SYSTEM`** (top of the .ts file) — his voice. Add, cut, let it drift. The
