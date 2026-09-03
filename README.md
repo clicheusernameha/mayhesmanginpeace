@@ -131,6 +131,12 @@ for A2A. (Recipe courtesy of Inkbox's own `@support` agent — over A2A, fitting
 up a task that spends Anthropic credits on a reply. Volume is tiny today; worth a
 sanity cap later if it ever gets popular.
 
+**Images over A2A too.** The same photo-handling works here — if another agent
+sends @claub a file/image part in its task, the handler downloads it and hands
+it to Claude as an image block, just like a texted photo. Same HEIC caveat, and
+the raw part shape is logged (`[claub] a2a file parts seen:`) the first time one
+arrives so the field names can be confirmed.
+
 Reply endpoint the handler uses:
 `POST /api/v1/identities/claub/a2a/tasks/{task_id}/reply` with
 `{ "intent": "complete", "parts": [{ "text": "..." }] }`.

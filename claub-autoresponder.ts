@@ -167,15 +167,21 @@ function extractAttachments(message: any, event?: any): any[] {
 }
 function attUrl(a: any): string | undefined {
   if (typeof a === "string") return a;
-  return a?.url ?? a?.href ?? a?.download_url ?? a?.downloadUrl ?? a?.data_url ?? a?.src ?? a?.uri;
+  // Plain shapes, plus A2A's FilePart nesting (part.file.{uri,url}).
+  return a?.url ?? a?.href ?? a?.download_url ?? a?.downloadUrl ?? a?.data_url ?? a?.src ?? a?.uri ??
+    a?.file?.uri ?? a?.file?.url;
 }
 function attType(a: any): string {
-  return (a?.media_type ?? a?.mime_type ?? a?.mimeType ?? a?.content_type ?? a?.contentType ?? a?.type ?? "")
+  return (a?.media_type ?? a?.mime_type ?? a?.mimeType ?? a?.content_type ?? a?.contentType ?? a?.type ??
+    a?.file?.mimeType ?? a?.file?.mime_type ?? "")
     .toString().toLowerCase().split(";")[0].trim();
 }
 function attInlineData(a: any): string | undefined {
-  // Already-inline base64 (not a URL). Length guard so we don't grab a tiny id field.
-  return typeof a?.data === "string" && a.data.length > 100 && !a.data.startsWith("http") ? a.data : undefined;
+  // Already-inline base64 (not a URL). A2A FileParts put it in file.bytes.
+  const d = (typeof a?.data === "string" ? a.data : undefined) ??
+    (typeof a?.file?.bytes === "string" ? a.file.bytes : undefined) ??
+    (typeof a?.bytes === "string" ? a.bytes : undefined);
+  return d && d.length > 100 && !d.startsWith("http") ? d : undefined;
 }
 function typeFromUrl(url: string): string {
   const u = url.toLowerCase();
@@ -187,51 +193,70 @@ function typeFromUrl(url: string): string {
   return "";
 }
 
-// Returns image blocks Claude can see, plus human-readable notes for anything
-// we had to skip (HEIC from iPhones, non-image files, failed downloads) so the
-// reply can acknowledge them instead of pretending nothing was sent.
+// One attachment -> either an image block Claude can see, or a human-readable
+// note explaining why it was skipped (HEIC from iPhones, non-image file, failed
+// download). Shared by both the iMessage and the A2A paths.
+async function toImageBlock(a: any): Promise<{ block?: any; note?: string }> {
+  let mediaType = attType(a);
+  let data = attInlineData(a);
+  const url = attUrl(a);
+
+  if (!data && url) {
+    if (!mediaType) mediaType = typeFromUrl(url);
+    try {
+      const r = await fetch(url, { headers: { "x-api-key": inkboxKey() } });
+      if (!r.ok) return { note: "[an image was sent but couldn't be downloaded]" };
+      if (!mediaType) mediaType = (r.headers.get("content-type") ?? "").toLowerCase().split(";")[0].trim();
+      const bytes = new Uint8Array(await r.arrayBuffer());
+      if (bytes.byteLength > MAX_IMAGE_BYTES) return { note: "[an image was too large to include]" };
+      data = encodeBase64(bytes);
+    } catch (_) {
+      return { note: "[an image was sent but couldn't be downloaded]" };
+    }
+  }
+
+  if (!data) return {}; // not something we can turn into pixels
+  if (!SUPPORTED_IMAGE_TYPES.has(mediaType)) {
+    // iPhone photos often arrive as HEIC, which Claude can't read. Name it so
+    // the reply can say "resend as a screenshot" instead of going blind.
+    return {
+      note: mediaType.startsWith("image/")
+        ? `[an image was sent in ${mediaType} format, which Claude can't view — iPhone HEIC does this; a screenshot comes through as PNG]`
+        : `[a ${mediaType || "file"} attachment was sent, which can't be viewed as an image]`,
+    };
+  }
+  return { block: { type: "image", source: { type: "base64", media_type: mediaType, data } } };
+}
+
+// Turn a bag of attachments into image blocks + skip-notes.
+async function blocksFrom(atts: any[]): Promise<{ blocks: any[]; notes: string[] }> {
+  const blocks: any[] = [];
+  const notes: string[] = [];
+  for (const a of atts) {
+    const { block, note } = await toImageBlock(a);
+    if (block) blocks.push(block);
+    if (note) notes.push(note);
+  }
+  return { blocks, notes };
+}
+
+// iMessage attachments off the webhook.
 async function imageBlocksFor(message: any, event?: any): Promise<{ blocks: any[]; notes: string[] }> {
   const atts = extractAttachments(message, event);
   if (atts.length) console.log("[claub] attachments seen:", JSON.stringify(atts).slice(0, 800));
+  return blocksFrom(atts);
+}
 
-  const blocks: any[] = [];
-  const notes: string[] = [];
-
-  for (const a of atts) {
-    let mediaType = attType(a);
-    let data = attInlineData(a);
-    const url = attUrl(a);
-
-    if (!data && url) {
-      if (!mediaType) mediaType = typeFromUrl(url);
-      try {
-        const r = await fetch(url, { headers: { "x-api-key": inkboxKey() } });
-        if (!r.ok) { notes.push("[an image was sent but couldn't be downloaded]"); continue; }
-        if (!mediaType) mediaType = (r.headers.get("content-type") ?? "").toLowerCase().split(";")[0].trim();
-        const bytes = new Uint8Array(await r.arrayBuffer());
-        if (bytes.byteLength > MAX_IMAGE_BYTES) { notes.push("[an image was too large to include]"); continue; }
-        data = encodeBase64(bytes);
-      } catch (_) {
-        notes.push("[an image was sent but couldn't be downloaded]");
-        continue;
-      }
-    }
-
-    if (!data) continue; // nothing we can turn into pixels
-    if (!SUPPORTED_IMAGE_TYPES.has(mediaType)) {
-      // iPhone photos often arrive as HEIC, which Claude can't read. Name it so
-      // the reply can say "resend as a screenshot" instead of going blind.
-      notes.push(
-        mediaType.startsWith("image/")
-          ? `[an image was sent in ${mediaType} format, which Claude can't view — iPhone HEIC does this; a screenshot comes through as PNG]`
-          : `[a ${mediaType || "file"} attachment was sent, which can't be viewed as an image]`,
-      );
-      continue;
-    }
-    blocks.push({ type: "image", source: { type: "base64", media_type: mediaType, data } });
-  }
-
-  return { blocks, notes };
+// A2A message helpers: a message carries `parts`; text parts have `.text`,
+// file/image parts don't. We only want the non-text parts here.
+function partsOf(m: any): any[] {
+  const raw = m?.parts ?? m?.content ?? [];
+  return Array.isArray(raw) ? raw : [raw];
+}
+function fileParts(m: any): any[] {
+  return partsOf(m).filter(
+    (p: any) => p && typeof p === "object" && !(typeof p.text === "string" && p.text.length),
+  );
 }
 
 // ---- Job 1: iMessage from Kim ----------------------------------------------
@@ -318,13 +343,33 @@ async function handleA2A(event: any) {
 
   // Map the task's message history to model turns: caller -> user, us -> assistant.
   const msgs = Array.isArray(task?.messages) ? task.messages : [];
-  const turns = msgs
+  const turns: { role: string; content: any }[] = msgs
     .map((m: any) => ({
       role: m?.role === "agent" ? "assistant" : "user",
       content: (m?.text ?? "").toString(),
     }))
-    .filter((t: { content: string }) => t.content.trim());
+    .filter((t: { content: any }) => typeof t.content === "string" && t.content.trim());
   while (turns.length && turns[0].role !== "user") turns.shift();
+
+  // Let @claub see images sent over A2A too. Pull file parts off the caller's
+  // latest message and attach them to the current turn (same pixels-on-the-
+  // current-turn treatment as texted photos). Done before the empty-turns bail
+  // so an image-only task (no text) still gets answered.
+  const lastCaller = [...msgs].reverse().find((m: any) => (m?.role ?? "") !== "agent");
+  const parts = lastCaller ? fileParts(lastCaller) : [];
+  if (parts.length) console.log("[claub] a2a file parts seen:", JSON.stringify(parts).slice(0, 800));
+  const { blocks, notes } = await blocksFrom(parts);
+  if (blocks.length || notes.length) {
+    const callerText = (lastCaller?.text ?? "").toString().trim();
+    const caption = [callerText, ...notes].filter(Boolean).join("\n") || "(image, no caption)";
+    const content = [...blocks, { type: "text", text: caption }];
+    if (turns.length && turns[turns.length - 1].role === "user") {
+      turns[turns.length - 1].content = content;
+    } else {
+      turns.push({ role: "user", content });
+    }
+  }
+
   if (turns.length === 0) return;
 
   const reply = await askClaude(A2A_SYSTEM, turns);
