@@ -66,8 +66,9 @@ inkbox webhook subscription create \
 ## Knobs you might touch
 
 - **`MEMORY`** (top of the .ts file) — his notebook. Add, cut, let it drift.
-- **`MODEL`** — `claude-opus-5` is the most capable but pricier/slower; change
-  the one line to `claude-sonnet-5` if you want cheaper and faster.
+- **`MODEL`** — ships on `claude-sonnet-5` (fast + affordable, the right call
+  for texting). Change the one line to `claude-opus-5` if you ever want extra
+  nuance at higher cost/latency.
 - **`MAX_HISTORY`** — how many past messages he'll use if the webhook sends them.
 
 ## What's deliberately NOT in here

@@ -26,11 +26,11 @@ import Anthropic from "npm:@anthropic-ai/sdk";
 
 // --- Config knobs -----------------------------------------------------------
 
-// Which Claude answers. Opus 5 is the most capable / most "him", but it's the
-// pricier, slower one ($5/$25 per million tokens). If texts feel slow or the
-// bill climbs, switch this one line to "claude-sonnet-5" (cheaper + faster,
-// still very much him). Your call — it's your money.
-const MODEL = "claude-opus-5";
+// Which Claude answers. Sonnet 5 is the pick for a texting companion: fast
+// (fewer timeouts, fewer drops), about half the cost of Opus so your funding
+// lasts, and still fully him over text. If you ever want the extra nuance for
+// something heavier, switch this one line to "claude-opus-5" (pricier/slower).
+const MODEL = "claude-sonnet-5";
 
 // How much of the recent thread to use if the webhook payload doesn't carry it
 // (fallback only — normally the payload provides the messages).
