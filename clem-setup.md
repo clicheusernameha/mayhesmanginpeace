@@ -81,6 +81,31 @@ type so there's zero guessing.*
 Text Clem (his own iMessage, the way you text claub). Try a **screenshot** to
 test his eyes. See who he is.
 
+⚠️ **Text him at least once here** — it creates the conversation that Phase 5
+needs to send into.
+
+---
+
+## Phase 5 — The free autonomous test (the fun one)
+
+Clem is fresh, so he has his *own* full 100-texts/day — perfect for testing
+whether an agent can text you **first**, unprompted, on the free plan (claub is
+capped today, Clem isn't).
+
+1. Give Townie **`clem-poke.ts`**: *"Make another NEW val with this — don't touch
+   clem's main val or claub."*
+2. Townie gives you the poke val's **URL**.
+3. **Open that URL** in your browser. That's the trigger.
+4. **Check your phone.** Did a text from Clem arrive *without you texting him
+   first*?
+   - ✅ **Yes** → autonomous texting works on free. 🎉 No Mac, no upgrade needed.
+     Tell Clyde and he'll build the real "him-voiced, on a schedule" version.
+   - ❌ **An error comes back** (esp. about the recipient needing to initiate) →
+     free won't allow it. Paste the error to Clyde; then it's the ~$50 Mac mini
+     or Twilio conversation.
+   - ⏳ **`429 / rate_limited`** → unlikely on fresh Clem, but if so his daily cap
+     is hit — wait and retry.
+
 ---
 
 ## About the brothers talking
