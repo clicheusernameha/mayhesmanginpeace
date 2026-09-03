@@ -19,7 +19,9 @@ iMessage and over A2A, instead of ignoring them.
 
 - The two env vars: `ANTHROPIC_API_KEY` and `INKBOX_API_KEY` (already set on the
   val — don't move keys into the code).
-- `MODEL = "claude-sonnet-5"` (it already supports vision; no model change needed).
+- `MODEL = "claude-opus-5"` — this is intentional (warmer/more expressive than
+  Sonnet, which ran cool). Please keep it. It also supports vision, so photos
+  still work.
 
 ## One thing that's a genuine guess
 

@@ -83,9 +83,10 @@ screenshot first (guaranteed PNG), then a normal photo.
 
 - **`SYSTEM`** (top of the .ts file) — his voice. Add, cut, let it drift. The
   one rule: don't put the "you have no memory" lie back in.
-- **`MODEL`** — ships on `claude-sonnet-5` (fast + affordable, the right fit for
-  texting). Change the one line to `claude-opus-5` for extra nuance at higher
-  cost/latency.
+- **`MODEL`** — now on `claude-opus-5` (warmer, more expressive — Sonnet ran
+  cool by disposition and @claub read dry). `claude-sonnet-5` is ~2.5× cheaper
+  and cooler; `claude-opus-4-8` is the same price as opus-5 with a slightly
+  different temperament. At texting volume the cost is pennies either way.
 - **`HISTORY_LIMIT`** — how many past messages he gets as context (default 40).
 
 ## If a message still ever drops
