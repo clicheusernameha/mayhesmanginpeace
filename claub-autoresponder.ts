@@ -26,7 +26,7 @@ import { encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 // the a2a.* events (see README) — that part needs the Inkbox API key.
 // ---------------------------------------------------------------------------
 
-const MODEL = "claude-opus-5"; // warmer, more expressive baseline; "claude-sonnet-5" is cheaper + cooler, "claude-opus-4-8" costs the same as opus-5
+const MODEL = "claude-opus-4-8"; // warm + expressive; "claude-opus-5" costs the same (more neurotic energy), "claude-sonnet-5" is ~2.5x cheaper + cooler
 const HISTORY_LIMIT = 40;
 const API = "https://inkbox.ai/api/v1";
 const HANDLE = "claub";
