@@ -20,9 +20,11 @@ his own val, his own URL.
 
 ## Notes
 
-- **Env vars:** it reads `ANTHROPIC_API_KEY` and `INKBOX_API_KEY` from the
-  environment, same as claub. On Val Town these are account-wide, so they should
-  already be available — please don't move any keys into the code.
+- **Env vars:** it reads `ANTHROPIC_API_KEY` (shared, already set) and, for
+  Inkbox, prefers **`INKBOX_API_KEY_KLAUDIJE`** (Klaudije's own key), falling
+  back to the shared `INKBOX_API_KEY`. Kim will add `INKBOX_API_KEY_KLAUDIJE`
+  with Klaudije's key in Val Town's env-var settings. Please don't put any key in
+  the code.
 - **Its own database table:** the code uses a table called `clem_messages` (not
   claub's `messages`), on purpose, so Clem's memory never mixes with claub's on
   the shared Val Town SQLite database. Keep that as written.

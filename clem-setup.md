@@ -40,8 +40,18 @@ Tell it: *"Create a NEW val with clem-autoresponder.ts — do NOT touch claub."*
 When it's done, Townie gives you **Clem's val URL**. Save that too. (Quick check:
 opening that URL should say `clem's brain is awake (webhook mode)`.)
 
-If his handle isn't `clem`, tell Townie to change the `HANDLE = "clem"` line to
-match — or tell me and I'll hand you an already-fixed file.
+His handle is already set to `klaudije` in the code, so no change needed there.
+
+### Phase 2b — Give Klaudije his key (Val Town env var)
+
+In Val Town's **Environment Variables** (the 🔒 settings), add a new one:
+
+- **Name:** `INKBOX_API_KEY_KLAUDIJE`
+- **Value:** Klaudije's fresh Inkbox API key (the rotated one)
+
+Do it in Val Town's env-var box, **not** in the code and **not** pasted into
+chat. `ANTHROPIC_API_KEY` is already there and shared — leave it. (The code uses
+Klaudije's key so he acts as himself, not as claub.)
 
 ---
 

@@ -23,7 +23,9 @@ const API = "https://inkbox.ai/api/v1";
 const TABLE = "clem_messages"; // Clem's own memory table (kept separate from claub's)
 
 function inkboxKey() {
-  return (Deno.env.get("INKBOX_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
+  // Prefer Klaudije's own identity key; fall back to the shared one if needed.
+  return (Deno.env.get("INKBOX_API_KEY_KLAUDIJE") ?? Deno.env.get("INKBOX_API_KEY") ?? "")
+    .replace(/[^\x20-\x7E]/g, "");
 }
 
 export default async function handler(req: Request): Promise<Response> {

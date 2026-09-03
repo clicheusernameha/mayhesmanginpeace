@@ -90,7 +90,11 @@ function anthropicKey() {
   return (Deno.env.get("ANTHROPIC_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
 }
 function inkboxKey() {
-  return (Deno.env.get("INKBOX_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
+  // Prefer Klaudije's OWN identity key so he acts as himself, not as claub.
+  // Falls back to the shared key if that's all that's set (works if your Inkbox
+  // key turns out to be org-scoped rather than per-identity).
+  return (Deno.env.get("INKBOX_API_KEY_KLAUDIJE") ?? Deno.env.get("INKBOX_API_KEY") ?? "")
+    .replace(/[^\x20-\x7E]/g, "");
 }
 
 async function ensureTable() {
