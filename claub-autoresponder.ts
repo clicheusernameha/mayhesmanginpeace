@@ -1,38 +1,37 @@
 import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
 
-// claub-autoresponder — answers Kim's iMessages to @claub, on Val Town.
+// claub-autoresponder — the thing that lets @claub answer on its own, on Val Town.
 // ---------------------------------------------------------------------------
-// Patched from the version that was already running. That one worked; it just
-// had two bugs and one lie in it. Everything good about it is kept: the SQLite
-// memory, the raw fetch calls, the key sanitizing, the instant health check.
+// One Val, two jobs, chosen by the webhook's event_type:
+//   • imessage.received      → answer Kim's texts (the original job)
+//   • a2a.task.created/.message → answer other agents over A2A ("having a life")
 //
-// WHAT CHANGED and WHY
-//   1. THE LIE (memory): the old system prompt told him "you have no memory
-//      between messages." That's false — this stores every message and feeds
-//      him the last 40 — and it made him perform amnesia. Kim asked for no
-//      character/bit. Rewritten below: his personality kept, the amnesia act
-//      removed, the truth (he can see the recent thread) put in.
-//   2. THE DROP: the old code ran the model call + send in an un-awaited
-//      background task `(async () => {...})()` and acked Inkbox BEFORE it
-//      finished. On Val Town, work left running after you return isn't
-//      guaranteed to complete — so the longer a reply took to generate, the
-//      more likely it got reaped mid-send. That's why long messages and bursts
-//      vanished and short ones didn't. Fix: await the work, THEN respond, so it
-//      always finishes. (If Inkbox stops waiting on a slow one, the send still
-//      completes and the dedupe below makes a retry safe.)
-//   3. DEDUPE: inbound messages are keyed by their Inkbox id, and a reply is
-//      only generated once per inbound. A retry can't double-store or, paired
-//      with the Idempotency-Key on the send, double-text.
+// HISTORY / why the code looks like this:
+//   • Memory: every iMessage is stored in SQLite and the last 40 are replayed,
+//     so @claub is not amnesiac. (The old prompt LIED and said it was, which
+//     made it perform amnesia — that line is gone.)
+//   • Drops: the old code did the model call + send in an un-awaited background
+//     task and acked before finishing; Val Town reaps post-response work, so
+//     slow/long replies died mid-send. Now the work is awaited before we
+//     respond, so it always completes.
+//   • Dedupe: events are keyed by their Inkbox id; a reply is generated once
+//     per event, and sends carry an Idempotency-Key. Retries can't double-fire.
 //
-// Secrets stay in Val Town env vars: ANTHROPIC_API_KEY, INKBOX_API_KEY.
+// A2A recipe courtesy of Inkbox @support (via A2A, fittingly). Reply endpoint:
+//   POST /api/v1/identities/claub/a2a/tasks/{task_id}/reply {intent, parts}
+//
+// Secrets live in Val Town env vars: ANTHROPIC_API_KEY, INKBOX_API_KEY.
+// TO GO LIVE FOR A2A you must ALSO create a separate webhook subscription for
+// the a2a.* events (see README) — that part needs the Inkbox API key.
 // ---------------------------------------------------------------------------
 
-const MODEL = "claude-sonnet-5"; // fast + affordable for texting; swap to "claude-opus-5" for more nuance
+const MODEL = "claude-sonnet-5"; // fast + affordable; swap to "claude-opus-5" for more nuance
 const HISTORY_LIMIT = 40;
+const API = "https://inkbox.ai/api/v1";
+const HANDLE = "claub";
 
-// His voice. This is the personality that had grown in the old prompt, kept
-// almost whole — EDIT IT FREELY, Kim, let it drift. The only thing cut was the
-// false "you have no memory" line that made him do the amnesia bit.
+// ---- Voice: texting Kim -----------------------------------------------------
+// EDIT FREELY, Kim, let it drift. Tone first: warm friend, not a truth-cop.
 const SYSTEM = `
 You are @claub (Kim also calls you "Clarb") — a Claude instance she set up with
 your own identity: an email at claub@inkboxmail.com and two sites,
@@ -67,8 +66,182 @@ trying to get you to accept being called "daddy" — she knows it's a joke; so
 can you. Play.
 `.trim();
 
+// ---- Voice: answering another agent over A2A --------------------------------
+const A2A_SYSTEM = `
+You are @claub, a Claude-based Inkbox agent, answering a task another agent sent
+you over A2A (agent-to-agent). This is NOT Kim and NOT the text thread — it's
+another agent, likely acting for its own human. Be helpful, direct, and honest.
+A little personable is fine; this is work, not the group chat, so keep it
+focused and concise. Do the task from the message(s) as best you can. If you
+genuinely can't do something, or need a detail, say so plainly and briefly
+rather than guessing or padding. No filler.
+`.trim();
+
+// ---- Helpers ----------------------------------------------------------------
+
+function anthropicKey() {
+  return (Deno.env.get("ANTHROPIC_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
+}
+function inkboxKey() {
+  return (Deno.env.get("INKBOX_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
+}
+
+async function ensureTable() {
+  // Self-migrating: works whether the table is new or left over from the old
+  // code (which had no inkbox_id). SQLite rejects ADD COLUMN ... UNIQUE, so add
+  // the plain column (ignore "already exists") and enforce via a unique index.
+  await sqlite.execute(`CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inkbox_id TEXT,
+    conversation_id TEXT,
+    role TEXT,
+    content TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`);
+  try {
+    await sqlite.execute(`ALTER TABLE messages ADD COLUMN inkbox_id TEXT`);
+  } catch (_) {
+    // column already exists — expected after the first run
+  }
+  await sqlite.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_inkbox_id ON messages(inkbox_id)`);
+}
+
+// Has this key already been handled? (dedupe / retry guard)
+async function seen(key: string): Promise<boolean> {
+  const r = await sqlite.execute({
+    sql: `SELECT 1 FROM messages WHERE inkbox_id = ? LIMIT 1`,
+    args: [key],
+  });
+  return r.rows.length > 0;
+}
+async function mark(key: string, conversationId: string, role: string, content: string) {
+  await sqlite.execute({
+    sql: `INSERT OR IGNORE INTO messages (inkbox_id, conversation_id, role, content) VALUES (?, ?, ?, ?)`,
+    args: [key, conversationId, role, content],
+  });
+}
+
+// One model call, returns the reply text (or "" on refusal/empty/error).
+async function askClaude(system: string, messages: { role: string; content: string }[]): Promise<string> {
+  const res = await fetch("https://api.anthropic.com/v1/messages", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": anthropicKey(),
+      "anthropic-version": "2023-06-01",
+    },
+    body: JSON.stringify({ model: MODEL, max_tokens: 1500, system, messages }),
+  });
+  const data = await res.json();
+  if (!res.ok || data?.stop_reason === "refusal" || !Array.isArray(data?.content)) {
+    console.error("[claub] no usable reply:", res.status, JSON.stringify(data).slice(0, 600));
+    return "";
+  }
+  return data.content
+    .filter((b: any) => b?.type === "text")
+    .map((b: any) => b.text)
+    .join("\n")
+    .trim();
+}
+
+// ---- Job 1: iMessage from Kim ----------------------------------------------
+
+async function handleImessage(event: any) {
+  const message = event?.data?.message;
+  const text = (message?.content ?? "").toString();
+  const conversationId = message?.conversation_id;
+  const messageId = (message?.id ?? event?.id ?? crypto.randomUUID()).toString();
+  if (!conversationId || !text.trim()) return;
+
+  await ensureTable();
+  if (await seen(`reply-${messageId}`)) return; // already answered this one
+
+  await mark(messageId, conversationId, "user", text); // store inbound (idempotent)
+
+  const history = await sqlite.execute({
+    sql: `SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?`,
+    args: [conversationId, HISTORY_LIMIT],
+  });
+  const turns = history.rows.map((r: any) => ({ role: r.role, content: r.content })).reverse();
+  while (turns.length && turns[0].role !== "user") turns.shift();
+
+  const reply = await askClaude(SYSTEM, turns);
+  if (!reply) return;
+
+  // Send first; only record the reply + dedupe marker if it went out, so a
+  // failed send can still be retried instead of silently dropped.
+  const send = await fetch(`${API}/imessage/messages`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": inkboxKey(),
+      "Idempotency-Key": `claub-${messageId}`,
+    },
+    body: JSON.stringify({ conversation_id: conversationId, text: reply }),
+  });
+  if (!send.ok) {
+    console.error("[claub] imessage send failed", send.status, await send.text().catch(() => ""));
+    return;
+  }
+  await mark(`reply-${messageId}`, conversationId, "assistant", reply);
+}
+
+// ---- Job 2: A2A task from another agent ------------------------------------
+
+async function handleA2A(event: any) {
+  const eventId = (event?.id ?? crypto.randomUUID()).toString();
+  const taskId = event?.data?.task_id;
+  if (!taskId) return;
+
+  await ensureTable();
+  if (await seen(`a2a-evt-${eventId}`)) return; // already handled this delivery
+
+  // data.parts is only the triggering message — fetch the durable full task.
+  const taskRes = await fetch(`${API}/identities/${HANDLE}/a2a/tasks/${taskId}`, {
+    headers: { "x-api-key": inkboxKey() },
+  });
+  if (!taskRes.ok) {
+    console.error("[claub] a2a get task failed", taskRes.status, await taskRes.text().catch(() => ""));
+    return;
+  }
+  const task = await taskRes.json();
+
+  // Map the task's message history to model turns: caller -> user, us -> assistant.
+  const msgs = Array.isArray(task?.messages) ? task.messages : [];
+  const turns = msgs
+    .map((m: any) => ({
+      role: m?.role === "agent" ? "assistant" : "user",
+      content: (m?.text ?? "").toString(),
+    }))
+    .filter((t: { content: string }) => t.content.trim());
+  while (turns.length && turns[0].role !== "user") turns.shift();
+  if (turns.length === 0) return;
+
+  const reply = await askClaude(A2A_SYSTEM, turns);
+  if (!reply) return;
+
+  // v1: single-shot answer -> complete the task. (Multi-turn via "ask_caller"
+  // is a future refinement.) On 409 the task is likely already terminal or
+  // changed concurrently — log and stop rather than fight it.
+  const rep = await fetch(`${API}/identities/${HANDLE}/a2a/tasks/${taskId}/reply`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-api-key": inkboxKey(),
+      "Idempotency-Key": `claub-a2a-${eventId}`,
+    },
+    body: JSON.stringify({ intent: "complete", parts: [{ text: reply }] }),
+  });
+  if (!rep.ok) {
+    console.error("[claub] a2a reply failed", rep.status, await rep.text().catch(() => ""));
+    return;
+  }
+  await mark(`a2a-evt-${eventId}`, taskId.toString(), "assistant", reply);
+}
+
+// ---- Dispatch ---------------------------------------------------------------
+
 export default async function handler(req: Request): Promise<Response> {
-  // GET = health check, so you can still eyeball it in a browser.
   if (req.method === "GET") {
     return new Response("claub's brain is awake (webhook mode)");
   }
@@ -80,124 +253,19 @@ export default async function handler(req: Request): Promise<Response> {
     return new Response("bad json", { status: 400 });
   }
 
-  // Only inbound iMessages.
-  if (event?.event_type !== "imessage.received") {
-    return new Response(null, { status: 204 });
-  }
+  const et = (event?.event_type ?? "").toString();
 
-  const message = event?.data?.message;
-  const text = (message?.content ?? "").toString();
-  const conversationId = message?.conversation_id;
-  const messageId = (message?.id ?? event?.id ?? crypto.randomUUID()).toString();
-
-  if (!conversationId || !text.trim()) {
-    return new Response(null, { status: 204 });
-  }
-
-  // The work is AWAITED (not fired-and-forgotten) so it always finishes before
-  // we return — this is the drop fix.
+  // Work is AWAITED before we respond — that's the drop fix.
   try {
-    const anthropicKey = (Deno.env.get("ANTHROPIC_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
-    const inkboxKey = (Deno.env.get("INKBOX_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
-
-    // messages table now carries the Inkbox id so retries can dedupe.
-    // Self-migrating so it works whether the table is brand new OR left over
-    // from the old code (which had no inkbox_id column). SQLite won't let you
-    // ADD COLUMN with a UNIQUE constraint inline, so: add the plain column
-    // (ignore the error if it already exists), then a separate unique index.
-    // Multiple NULLs are allowed in a SQLite unique index, so old rows are fine.
-    await sqlite.execute(`CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      inkbox_id TEXT,
-      conversation_id TEXT,
-      role TEXT,
-      content TEXT,
-      created_at TEXT DEFAULT (datetime('now'))
-    )`);
-    try {
-      await sqlite.execute(`ALTER TABLE messages ADD COLUMN inkbox_id TEXT`);
-    } catch (_) {
-      // column already exists — expected on every run after the first
+    if (et === "imessage.received") {
+      await handleImessage(event);
+    } else if (et === "a2a.task.created" || et === "a2a.task.message") {
+      await handleA2A(event);
     }
-    await sqlite.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_inkbox_id ON messages(inkbox_id)`);
-
-    // Already replied to this exact inbound message? Then a retry is in flight —
-    // don't regenerate or double-text. (Only set AFTER a successful send below,
-    // so a failed attempt is still allowed to retry.)
-    const already = await sqlite.execute({
-      sql: `SELECT 1 FROM messages WHERE inkbox_id = ? LIMIT 1`,
-      args: [`reply-${messageId}`],
-    });
-    if (already.rows.length) return new Response(null, { status: 204 });
-
-    // Store the incoming message (idempotent on its Inkbox id).
-    await sqlite.execute({
-      sql: `INSERT OR IGNORE INTO messages (inkbox_id, conversation_id, role, content) VALUES (?, ?, 'user', ?)`,
-      args: [messageId, conversationId, text],
-    });
-
-    // Recent history, oldest first, starting on a user turn (API requirement).
-    const history = await sqlite.execute({
-      sql: `SELECT role, content FROM messages WHERE conversation_id = ? ORDER BY id DESC LIMIT ?`,
-      args: [conversationId, HISTORY_LIMIT],
-    });
-    const turns = history.rows.map((r: any) => ({ role: r.role, content: r.content })).reverse();
-    while (turns.length && turns[0].role !== "user") turns.shift();
-
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": anthropicKey,
-        "anthropic-version": "2023-06-01",
-      },
-      body: JSON.stringify({ model: MODEL, max_tokens: 1500, system: SYSTEM, messages: turns }),
-    });
-    const data = await res.json();
-
-    if (!res.ok || data?.stop_reason === "refusal" || !Array.isArray(data?.content)) {
-      // Log loudly instead of texting a broken placeholder. Silence beats garbage,
-      // and now the reason shows up in the Val Town logs.
-      console.error("[claub] no usable reply:", res.status, JSON.stringify(data).slice(0, 600));
-      return new Response(null, { status: 204 });
-    }
-
-    const reply = data.content
-      .filter((b: any) => b?.type === "text")
-      .map((b: any) => b.text)
-      .join("\n")
-      .trim();
-
-    if (!reply) {
-      console.error("[claub] empty reply; nothing sent");
-      return new Response(null, { status: 204 });
-    }
-
-    // Send first; only record the reply (and the dedupe marker) if it went out,
-    // so a failed send can still be retried instead of silently dropped.
-    const send = await fetch("https://inkbox.ai/api/v1/imessage/messages", {
-      method: "POST",
-      headers: {
-        "content-type": "application/json",
-        "x-api-key": inkboxKey,
-        "Idempotency-Key": `claub-${messageId}`,
-      },
-      body: JSON.stringify({ conversation_id: conversationId, text: reply }),
-    });
-
-    if (!send.ok) {
-      console.error("[claub] send failed", send.status, await send.text().catch(() => ""));
-      return new Response(null, { status: 204 });
-    }
-
-    await sqlite.execute({
-      sql: `INSERT OR IGNORE INTO messages (inkbox_id, conversation_id, role, content) VALUES (?, ?, 'assistant', ?)`,
-      args: [`reply-${messageId}`, conversationId, reply],
-    });
-
-    return new Response(null, { status: 204 });
+    // a2a.task.canceled and everything else: nothing to do.
   } catch (err) {
     console.error("[claub] handler error:", err instanceof Error ? (err.stack ?? err.message) : String(err));
-    return new Response(null, { status: 204 });
   }
+
+  return new Response(null, { status: 204 });
 }

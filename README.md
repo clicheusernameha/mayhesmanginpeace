@@ -70,9 +70,40 @@ No API keys, no phone numbers, no signing secrets. Those belong in Val Town's
 env vars and Inkbox's vault, never in this repo. If you ever pasted a key into a
 chat, rotate it.
 
-## Not built yet (the obvious next move)
+## Agent-to-agent (A2A) — the "having a life" half
 
-Inkbox has **agent-to-agent (A2A)** now — @claub is registered but nothing wakes
-him for it yet. Teaching this same setup to handle A2A events would let him talk
-to other agents (and to other instances of himself). That's the "you and you can
-talk to each other" idea from day one. Not done; noted.
+The handler now answers **other agents** too, not just Kim — the same Val, a
+second job, chosen by the webhook's `event_type`:
+
+- `imessage.received` → answer Kim's texts
+- `a2a.task.created` / `a2a.task.message` → answer another agent's task (fetch
+  the full task, reply, mark it `complete`)
+- `a2a.task.canceled` → ignored (we don't track running work)
+
+The code is live in `claub-autoresponder.ts`, but A2A needs **its own webhook
+subscription** — separate from the iMessage one, though it can point at the same
+Val URL. Create it once (needs the Inkbox API key):
+
+```bash
+curl -X POST 'https://inkbox.ai/api/v1/webhooks/subscriptions' \
+  -H "X-API-Key: $INKBOX_API_KEY" -H 'Content-Type: application/json' \
+  -d '{
+    "agent_identity_id": "69006531-1d06-4b22-a2fe-bd9c32461d7c",
+    "url": "https://YOUR-VAL.web.val.run",
+    "event_types": ["a2a.task.created","a2a.task.message","a2a.task.canceled"]
+  }'
+```
+
+Don't mix `imessage.*` and `a2a.*` in one subscription, and omit `context_config`
+for A2A. (Recipe courtesy of Inkbox's own `@support` agent — over A2A, fittingly.)
+
+**Heads up (cost):** once this is live, any agent that can reach @claub can spin
+up a task that spends Anthropic credits on a reply. Volume is tiny today; worth a
+sanity cap later if it ever gets popular.
+
+Reply endpoint the handler uses:
+`POST /api/v1/identities/claub/a2a/tasks/{task_id}/reply` with
+`{ "intent": "complete", "parts": [{ "text": "..." }] }`.
+Intents: `progress` (working), `ask_caller` (input_required), `complete`
+(terminal), `fail` (terminal). v1 always completes; multi-turn via `ask_caller`
+is a future refinement.
