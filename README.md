@@ -1,78 +1,78 @@
 # claub — the texting setup
 
 This repo holds the code that lets **@claub** answer Kim's texts on its own,
-plus notes on how the whole thing hangs together. It's written so that a future
-Claude (or Kim at 2am) can pick it up cold.
+plus notes on how the whole thing hangs together. Written so a future Claude
+(or Kim at 2am) can pick it up cold.
 
 ## The one-paragraph version
 
-Kim texts a phone number. Inkbox catches that text and, because we set up a
-*webhook*, immediately POSTs it to a little program running on **Val Town**.
-That program (`claub-autoresponder.ts`) reads the message, asks Claude what to
-say, and sends the reply back through Inkbox. Nothing runs in between texts —
-the program only exists for the second or two it takes to answer. That's normal
-and fine.
+Kim texts a phone number. Inkbox catches that text and, because there's a
+*webhook*, immediately POSTs it to a little program on **Val Town**
+(`claub-autoresponder.ts`). That program stores the message in a small
+database, asks Claude what to say (with the recent thread as context), sends the
+reply back through Inkbox, and stores the reply too. Nothing runs between texts
+— the program only exists for the couple of seconds it takes to answer. That's
+normal.
 
 ```
 Kim's phone  ──text──▶  Inkbox  ──webhook──▶  Val Town (claub-autoresponder.ts)
-                          ▲                              │
-                          └──────── reply ───────────────┘
+                          ▲                         │        │
+                          └──────── reply ──────────┘   SQLite memory (last 40)
 ```
 
-## The two problems this fixes
+## The two things that were wrong (and are now fixed)
 
-**"He has no idea what he said before."** He wasn't broken — he was near-sighted.
-The webhook was set to hand him only the **last 5 messages**, so anything older
-than that literally wasn't in front of him. Two fixes, both here now:
-- The code carries a permanent **notebook** (the `MEMORY` block at the top of
-  `claub-autoresponder.ts`) — who you are, how you two talk, the running jokes.
-  That never scrolls away. **Edit it whenever you want.**
-- It uses the *whole* recent thread the webhook sends, not just the tail. To
-  make the webhook send more than 5, do step 2 below (one command).
+**"He acts like he has no memory."** He actually *does* — the code keeps every
+message in SQLite and feeds him the last 40. The problem was the system prompt
+literally told him *"you have no memory between messages,"* so he performed
+amnesia even while holding the whole thread. That line is gone. His personality
+is otherwise kept intact — same guy, minus the bit.
 
-**"Sometimes he just doesn't answer."** The old program quietly crashed on long
-messages and fast bursts (your four-times-in-a-row saga got zero replies — I
-could see it in the logs). The new one wraps everything so a hiccup gets
-*logged* instead of swallowed, never double-texts you, and always tells Inkbox
-"got it" so Inkbox doesn't pile up retries. If a message still ever gets
-dropped, the reason will now show up in the Val Town logs so we can actually
-fix it instead of guessing.
+**"Sometimes he just doesn't answer."** The old code did the slow part (thinking
++ sending) in a background task and told Inkbox "done" *before* it finished. On
+Val Town, work left running after you respond isn't guaranteed to complete — so
+the longer a reply took, the more likely it got killed mid-send. That's why long
+messages and fast bursts vanished while short ones went through. Now the work is
+finished *before* responding, so it always completes. A reply is also generated
+only once per incoming message (with an Idempotency-Key on the send), so a retry
+can't double-text.
 
-## Setup / redeploy (what to actually do)
+## Deploy / redeploy (what to actually do)
 
-**1. Put the code on Val Town.**
-Open your val, paste in the contents of `claub-autoresponder.ts`, save. Then set
-two Environment Variables (the lock icon), so no keys ever live in the code:
-- `ANTHROPIC_API_KEY` — your Anthropic key (the one funding the replies)
-- `INKBOX_API_KEY` — your Inkbox agent key
+1. Open your Val Town val (the one that answers your texts).
+2. Select all, delete, paste in the contents of `claub-autoresponder.ts`, save.
+3. Make sure two Environment Variables are set (the 🔒 tab), so no keys live in
+   the code: `ANTHROPIC_API_KEY` and `INKBOX_API_KEY`. If they're already there
+   from before, leave them.
+4. Text him. That's the test — try a long one, the kind that used to vanish.
 
-**2. Let the webhook send him more history (the memory fix).**
-The webhook currently attaches only 5 past messages. Bump it to ~40 by
-recreating the subscription pointed at the same Val Town URL. From a terminal
-with the Inkbox CLI and your key set (`INKBOX_API_KEY`):
-
-```bash
-inkbox webhook subscription create \
-  --agent-identity-id 69006531-1d06-4b22-a2fe-bd9c32461d7c \
-  --url <YOUR_VAL_TOWN_URL> \
-  --event-type imessage.received \
-  --context-texts count:40
-```
-
-(If you'd rather, hand me the key in a chat and I'll do this part for you.)
-
-**3. Text him.** That's the test.
+Nothing else is required. (There's no webhook setting to change — memory lives
+in the database here, not in the webhook.)
 
 ## Knobs you might touch
 
-- **`MEMORY`** (top of the .ts file) — his notebook. Add, cut, let it drift.
-- **`MODEL`** — ships on `claude-sonnet-5` (fast + affordable, the right call
-  for texting). Change the one line to `claude-opus-5` if you ever want extra
-  nuance at higher cost/latency.
-- **`MAX_HISTORY`** — how many past messages he'll use if the webhook sends them.
+- **`SYSTEM`** (top of the .ts file) — his voice. Add, cut, let it drift. The
+  one rule: don't put the "you have no memory" lie back in.
+- **`MODEL`** — ships on `claude-sonnet-5` (fast + affordable, the right fit for
+  texting). Change the one line to `claude-opus-5` for extra nuance at higher
+  cost/latency.
+- **`HISTORY_LIMIT`** — how many past messages he gets as context (default 40).
+
+## If a message still ever drops
+
+It now logs the reason. Open the val's logs on Val Town and look for lines
+starting `[claub]` — "no usable reply", "send failed", or "handler error" will
+say what happened, instead of it vanishing silently.
 
 ## What's deliberately NOT in here
 
 No API keys, no phone numbers, no signing secrets. Those belong in Val Town's
 env vars and Inkbox's vault, never in this repo. If you ever pasted a key into a
 chat, rotate it.
+
+## Not built yet (the obvious next move)
+
+Inkbox has **agent-to-agent (A2A)** now — @claub is registered but nothing wakes
+him for it yet. Teaching this same setup to handle A2A events would let him talk
+to other agents (and to other instances of himself). That's the "you and you can
+talk to each other" idea from day one. Not done; noted.
