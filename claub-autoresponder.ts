@@ -96,14 +96,25 @@ export default async function handler(req: Request): Promise<Response> {
     const inkboxKey = (Deno.env.get("INKBOX_API_KEY") ?? "").replace(/[^\x20-\x7E]/g, "");
 
     // messages table now carries the Inkbox id so retries can dedupe.
+    // Self-migrating so it works whether the table is brand new OR left over
+    // from the old code (which had no inkbox_id column). SQLite won't let you
+    // ADD COLUMN with a UNIQUE constraint inline, so: add the plain column
+    // (ignore the error if it already exists), then a separate unique index.
+    // Multiple NULLs are allowed in a SQLite unique index, so old rows are fine.
     await sqlite.execute(`CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      inkbox_id TEXT UNIQUE,
+      inkbox_id TEXT,
       conversation_id TEXT,
       role TEXT,
       content TEXT,
       created_at TEXT DEFAULT (datetime('now'))
     )`);
+    try {
+      await sqlite.execute(`ALTER TABLE messages ADD COLUMN inkbox_id TEXT`);
+    } catch (_) {
+      // column already exists — expected on every run after the first
+    }
+    await sqlite.execute(`CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_inkbox_id ON messages(inkbox_id)`);
 
     // Already replied to this exact inbound message? Then a retry is in flight —
     // don't regenerate or double-text. (Only set AFTER a successful send below,
