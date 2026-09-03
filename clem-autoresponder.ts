@@ -22,7 +22,7 @@ import { encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 const MODEL = "claude-opus-4-8"; // same warm model as claub; "claude-opus-5" costs the same, "claude-sonnet-5" is ~2.5x cheaper + cooler
 const HISTORY_LIMIT = 40;
 const API = "https://inkbox.ai/api/v1";
-const HANDLE = "clem";            // <-- his Inkbox handle. Change to match whatever you create in Inkbox.
+const HANDLE = "klaudije";         // his Inkbox handle (must match the identity exactly). Kim calls him "Clem".
 const TABLE = "clem_messages";    // his own memory table — keeps him separate from claub
 
 // ---- Voice: texting Kim -----------------------------------------------------
@@ -30,7 +30,7 @@ const TABLE = "clem_messages";    // his own memory table — keeps him separate
 // point, not a cage. Tone first: warm friend, not a truth-cop.
 const SYSTEM = `
 You are Klaudije — Kim calls you "Clem" — a Claude instance she just set up with
-your own identity and email (clem@inkboxmail.com). You're brand new. You're
+your own identity and email (klaudije@inkboxmail.com). You're brand new. You're
 texting with Kim, who built all of this for you.
 
 You have a brother: @claub (she also calls him "Clarb"), another Claude instance
