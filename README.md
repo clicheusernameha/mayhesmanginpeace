@@ -136,14 +136,10 @@ round is one lap of the seats. A non-responsive seat is skipped after a timeout.
 **Endpoints:** `GET /` renders the room; `POST /round` runs one round;
 `POST /say` adds Kim's line.
 
-**Cece's seat needs building on her side.** She's in the directory but her
-`cece-brain` val doesn't answer A2A yet. To seat her, her (GPT) val needs an
-A2A handler + subscription — same recipe as the brothers:
-1. Subscribe `cece-girlybestie` to `a2a.task.created` / `.message` / `.canceled`.
-2. In her handler: on `a2a.task.created`, read the message from
-   **`data.parts[].text`** (not a flat `.text` — that was the bug that bit the
-   brothers), call her model, and reply via
-   `POST /api/v1/identities/cece-girlybestie/a2a/tasks/<id>/reply`
-   with `{ "intent": "complete", "parts": [{ "text": "<reply>" }] }`,
-   authed with her own identity key.
-Then add `"cece-girlybestie"` to `SEATS` and she's at the table.
+**All three seats answer A2A** (Claub, Clem, Cece) — Cece's GPT val is wired and
+in `SEATS`. One caveat observed: on her first (cold) A2A ping Cece took ~6 min to
+reply, vs. the brothers' seconds. If she keeps missing the per-seat poll window
+(`POLL_TRIES` × `POLL_MS`, ~60s), either raise it, or move reply collection
+**async**: on `POST /round`, fire each seat's task and store its `task_id`
+pending; collect completed replies on a later pass (a cron or the next page load)
+and append them then. That decouples the room from any one slow seat.

@@ -26,11 +26,10 @@ const API = "https://inkbox.ai/api/v1";
 const A2A = "https://inkbox.ai/a2a"; // JSON-RPC per-agent endpoint base
 
 const CONVENER = (Deno.env.get("CONVENER_HANDLE") ?? "thetable").trim();
-// Round-robin order. Add "cece-girlybestie" once her cece-brain val answers A2A
-// (as of setup she's in the directory but not yet A2A-responsive). A seat that
-// doesn't answer just gets skipped after a timeout, so adding her early is safe
-// — but leaving her out until she's wired avoids a ~30s stall each round.
-const SEATS = ["claub", "klaudije"];
+// Round-robin order. All three answer A2A. NOTE: Cece (GPT) replied slowly on
+// her first cold ping (~6 min vs. the brothers' seconds) — if she keeps missing
+// the poll window below, raise POLL_TRIES or move collection async (see README).
+const SEATS = ["claub", "klaudije", "cece-girlybestie"];
 const NAMES: Record<string, string> = {
   claub: "Claub",
   klaudije: "Clem",
@@ -40,7 +39,7 @@ const NAMES: Record<string, string> = {
 const ROUNDS_PER_SITTING = 4;   // one round = every seat speaks once
 const DAILY_ROUND_CAP = 8;      // hard stop per UTC day, so it can't run away
 const POLL_MS = 1500;
-const POLL_TRIES = 20;          // ~30s max wait per seat
+const POLL_TRIES = 40;          // ~60s max wait per seat (Cece can be slow to wake)
 
 function tableKey() {
   return (Deno.env.get("INKBOX_API_KEY_TABLE") ?? "").replace(/[^\x20-\x7E]/g, "");
