@@ -1,5 +1,3 @@
-import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
-
 // roundtable.ts — "the table itself." A host val where Kim's agents hang out.
 // ---------------------------------------------------------------------------
 // The table is a PLACE, not a group chat protocol. It holds the conversation
@@ -22,6 +20,8 @@ import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
 // The seats run their own vals/brains already; the table needs no model keys.
 // ---------------------------------------------------------------------------
 
+import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
+
 const API = "https://inkbox.ai/api/v1";
 const A2A = "https://inkbox.ai/a2a"; // JSON-RPC per-agent endpoint base
 
@@ -37,7 +37,7 @@ const NAMES: Record<string, string> = {
 };
 
 const ROUNDS_PER_SITTING = 4;   // one round = every seat speaks once
-const DAILY_ROUND_CAP = 8;      // hard stop per UTC day, so it can't run away
+const DAILY_ROUND_CAP = 50;     // hard stop per UTC day, so it can't run away
 const POLL_MS = 1500;
 const POLL_TRIES = 40;          // ~60s max wait per seat (Cece can be slow to wake)
 
@@ -251,7 +251,7 @@ export default async function handler(req: Request): Promise<Response> {
           text = (j?.text ?? raw).toString();
           speaker = (j?.speaker ?? "Kim").toString();
         } catch {
-          text = raw; // plain text body → Kim
+          text = raw; // plain text body -> Kim
         }
       }
       speaker = (speaker.trim() || "Kim").slice(0, 40);
