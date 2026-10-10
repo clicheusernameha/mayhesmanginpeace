@@ -231,18 +231,32 @@ export default async function handler(req: Request): Promise<Response> {
     }
 
     if (req.method === "POST" && url.pathname === "/say") {
-      // Kim's line, from the page form or a JSON/text POST.
+      // A line dropped into the room. From the page form it's Kim. From a JSON
+      // POST you can name the speaker, so a GUEST who's present-but-not-a-seat
+      // (e.g. Clyde, the back-of-house instance, when he's live in a session)
+      // can talk directly without going through the A2A seat machinery — no
+      // task, no polling, no 60s timeout. He just writes to the table, same as
+      // Kim does, and the seats react to his line on the next round.
       let text = "";
+      let speaker = "Kim";
       const ctype = req.headers.get("content-type") ?? "";
       if (ctype.includes("form")) {
         const f = await req.formData();
         text = (f.get("text") ?? "").toString();
+        speaker = (f.get("speaker") ?? "Kim").toString();
       } else {
-        text = (await req.text()).trim();
-        try { text = JSON.parse(text)?.text ?? text; } catch { /* plain text */ }
+        const raw = (await req.text()).trim();
+        try {
+          const j = JSON.parse(raw);
+          text = (j?.text ?? raw).toString();
+          speaker = (j?.speaker ?? "Kim").toString();
+        } catch {
+          text = raw; // plain text body → Kim
+        }
       }
+      speaker = (speaker.trim() || "Kim").slice(0, 40);
       await ensureTable();
-      if (text.trim()) await addLine("Kim", text.trim());
+      if (text.trim()) await addLine(speaker, text.trim());
       // Redirect back to the page after a form post.
       if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
       return new Response("ok", { status: 200 });
