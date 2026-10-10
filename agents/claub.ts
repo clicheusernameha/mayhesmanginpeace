@@ -527,7 +527,7 @@ async function handleA2A(event: any) {
     Array.isArray(event?.data?.parts) ? event.data.parts.map((p: any) => p?.text ?? "").join(" ") : "",
     (event?.data?.text ?? "").toString(),
   ].join(" ");
-  const urlAtts = [...scanText.matchAll(/https?:\/\/[^\s<>"'\]]+\/img\/\d+/g)].map((m) => ({ url: m[0] }));
+  const urlAtts = [...scanText.matchAll(/https?:\/\/[^\s<>"'\]]+\/img\/[\w-]+/g)].map((m) => ({ url: m[0] }));
   if (urlAtts.length) console.log("[claub] a2a image urls in text:", urlAtts.map((a) => a.url).join(", "));
   const { blocks, notes } = await blocksFrom([...parts, ...urlAtts]);
   if (blocks.length || notes.length) {

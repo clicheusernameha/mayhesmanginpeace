@@ -24,7 +24,8 @@
 // ---------------------------------------------------------------------------
 
 import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
-import { decodeBase64, encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
+import { decodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
+import { blob } from "https://esm.town/v/std/blob";
 
 const API = "https://inkbox.ai/api/v1";
 const A2A = "https://inkbox.ai/a2a"; // JSON-RPC per-agent endpoint base
@@ -48,12 +49,14 @@ const DAILY_ROUND_CAP = 50;     // hard stop per UTC day, so it can't run away
 const POLL_MS = 1500;
 const POLL_TRIES = 40;          // ~60s max wait per seat (Cece can be slow to wake)
 
-// Image upload cap. Kept under the seats' own 5MB base64 ceiling (a 3.5MB file
-// is ~4.7MB base64) so a shared photo is actually viewable, not skipped.
-const MAX_UPLOAD_BYTES = 3_500_000;
+// Image upload cap. Bytes live in Val Town blob storage (not SQLite — a base64
+// blob there 500s past ~1MB). The page shows anything up to this; the Claude
+// seats skip images over their own ~5MB raw ceiling with a note, so very large
+// ones still display but may not be "seen".
+const MAX_UPLOAD_BYTES = 10_000_000;
 const VIEWABLE_IMAGE = /^image\/(jpeg|png|gif|webp)$/;
 
-type Row = { id: number; speaker: string; text: string; imageMime: string | null };
+type Row = { id: number; speaker: string; text: string; imageMime: string | null; imageKey: string | null };
 
 function tableKey() {
   return (Deno.env.get("INKBOX_API_KEY_TABLE") ?? "").replace(/[^\x20-\x7E]/g, "");
@@ -68,7 +71,8 @@ async function ensureTable() {
     created_at TEXT DEFAULT (datetime('now'))
   )`);
   // Self-migrate: add the image columns if this table predates photos.
-  for (const col of ["image_mime TEXT", "image_data TEXT"]) {
+  // image_key = blob storage key (new uploads); image_data = legacy base64.
+  for (const col of ["image_mime TEXT", "image_data TEXT", "image_key TEXT"]) {
     try {
       await sqlite.execute(`ALTER TABLE roundtable_messages ADD COLUMN ${col}`);
     } catch (_) {
@@ -77,16 +81,22 @@ async function ensureTable() {
   }
 }
 
-async function addLine(speaker: string, text: string, imageMime?: string | null, imageData?: string | null) {
+async function addLine(
+  speaker: string,
+  text: string,
+  imageMime?: string | null,
+  imageData?: string | null,
+  imageKey?: string | null,
+) {
   await sqlite.execute({
-    sql: `INSERT INTO roundtable_messages (speaker, text, image_mime, image_data) VALUES (?, ?, ?, ?)`,
-    args: [speaker, text, imageMime ?? null, imageData ?? null],
+    sql: `INSERT INTO roundtable_messages (speaker, text, image_mime, image_data, image_key) VALUES (?, ?, ?, ?, ?)`,
+    args: [speaker, text, imageMime ?? null, imageData ?? null, imageKey ?? null],
   });
 }
 
 async function transcriptRows(limit = 60): Promise<Row[]> {
   const r = await sqlite.execute({
-    sql: `SELECT id, speaker, text, image_mime FROM roundtable_messages ORDER BY id DESC LIMIT ?`,
+    sql: `SELECT id, speaker, text, image_mime, image_key FROM roundtable_messages ORDER BY id DESC LIMIT ?`,
     args: [limit],
   });
   return r.rows
@@ -95,6 +105,7 @@ async function transcriptRows(limit = 60): Promise<Row[]> {
       speaker: row.speaker,
       text: row.text,
       imageMime: row.image_mime ?? null,
+      imageKey: row.image_key ?? null,
     }))
     .reverse();
 }
@@ -212,14 +223,14 @@ async function askSeat(handle: string, prompt: string): Promise<string> {
 // prompt text instead and they fetch it themselves (see their handlers).
 async function newPhotoUrls(baseUrl: string, prevRoundId: number): Promise<string[]> {
   const r = await sqlite.execute({
-    sql: `SELECT id, image_mime FROM roundtable_messages
+    sql: `SELECT id, image_mime, image_key FROM roundtable_messages
           WHERE image_mime IS NOT NULL AND id > ? AND speaker != '__round__'
           ORDER BY id LIMIT 6`,
     args: [prevRoundId],
   });
   return r.rows
     .filter((row: any) => VIEWABLE_IMAGE.test(String(row.image_mime ?? "")))
-    .map((row: any) => `${baseUrl}/img/${Number(row.id)}`);
+    .map((row: any) => `${baseUrl}/img/${row.image_key ?? Number(row.id)}`);
 }
 
 // Run one round: every seat speaks once, in order.
@@ -258,9 +269,10 @@ async function renderPage(): Promise<string> {
       const body = m.text ? esc(m.text) : "";
       let media = "";
       if (m.imageMime) {
+        const ref = m.imageKey ?? m.id;
         media = m.imageMime.startsWith("image/")
-          ? `<img class="ph" src="/img/${m.id}" loading="lazy" alt="shared image">`
-          : `<a class="file" href="/img/${m.id}">📎 attachment</a>`;
+          ? `<img class="ph" src="/img/${ref}" loading="lazy" alt="shared image">`
+          : `<a class="file" href="/img/${ref}">📎 attachment</a>`;
       }
       return `<div class="line">${who}${body}${media}</div>`;
     }).join("")
@@ -303,22 +315,45 @@ export default async function handler(req: Request): Promise<Response> {
   try {
     // Serve a stored image/file by row id (public, so the seats can fetch it).
     if (req.method === "GET" && url.pathname.startsWith("/img/")) {
-      const id = Number(url.pathname.slice("/img/".length));
-      if (!Number.isFinite(id)) return new Response("bad id", { status: 400 });
+      const ref = decodeURIComponent(url.pathname.slice("/img/".length));
       await ensureTable();
-      const r = await sqlite.execute({
-        sql: `SELECT image_mime, image_data FROM roundtable_messages WHERE id = ?`,
-        args: [id],
+      // New uploads: bytes live in blob storage, keyed by image_key (a uuid).
+      const byKey = await sqlite.execute({
+        sql: `SELECT image_mime FROM roundtable_messages WHERE image_key = ? LIMIT 1`,
+        args: [ref],
       });
-      const row = r.rows?.[0] as any;
-      if (!row || !row.image_data) return new Response("not found", { status: 404 });
-      const bytes = decodeBase64(String(row.image_data));
-      return new Response(bytes, {
-        headers: {
-          "content-type": String(row.image_mime || "application/octet-stream"),
-          "cache-control": "public, max-age=31536000, immutable",
-        },
-      });
+      if (byKey.rows?.[0]) {
+        try {
+          const res = await blob.get(`rtimg_${ref}`);
+          const buf = new Uint8Array(await res.arrayBuffer());
+          return new Response(buf, {
+            headers: {
+              "content-type": String((byKey.rows[0] as any).image_mime || "application/octet-stream"),
+              "cache-control": "public, max-age=31536000, immutable",
+            },
+          });
+        } catch (_) {
+          return new Response("not found", { status: 404 });
+        }
+      }
+      // Back-compat: older rows stored base64 under the numeric row id.
+      const id = Number(ref);
+      if (Number.isFinite(id)) {
+        const r = await sqlite.execute({
+          sql: `SELECT image_mime, image_data FROM roundtable_messages WHERE id = ?`,
+          args: [id],
+        });
+        const row = r.rows?.[0] as any;
+        if (row && row.image_data) {
+          return new Response(decodeBase64(String(row.image_data)), {
+            headers: {
+              "content-type": String(row.image_mime || "application/octet-stream"),
+              "cache-control": "public, max-age=31536000, immutable",
+            },
+          });
+        }
+      }
+      return new Response("not found", { status: 404 });
     }
 
     if (req.method === "GET") {
@@ -335,6 +370,7 @@ export default async function handler(req: Request): Promise<Response> {
       let speaker = "Kim";
       let imageMime: string | null = null;
       let imageData: string | null = null;
+      let imageKey: string | null = null;
       const ctype = req.headers.get("content-type") ?? "";
       if (ctype.includes("form")) {
         const f = await req.formData();
@@ -344,11 +380,12 @@ export default async function handler(req: Request): Promise<Response> {
         if (file && typeof file === "object" && "arrayBuffer" in (file as any) && (file as File).size > 0) {
           const fo = file as File;
           if (fo.size > MAX_UPLOAD_BYTES) {
-            return new Response("that file's too big (max ~3.5MB — a screenshot usually fits)", { status: 413 });
+            return new Response("that photo's too big (max 10MB)", { status: 413 });
           }
           const buf = new Uint8Array(await fo.arrayBuffer());
           imageMime = (fo.type || "application/octet-stream").toLowerCase();
-          imageData = encodeBase64(buf);
+          imageKey = crypto.randomUUID();
+          await blob.set(`rtimg_${imageKey}`, new Blob([buf], { type: imageMime }));
         }
       } else {
         const raw = (await req.text()).trim();
@@ -363,10 +400,12 @@ export default async function handler(req: Request): Promise<Response> {
       speaker = (speaker.trim() || "Kim").slice(0, 40);
       text = text.trim();
       await ensureTable();
-      if (text || imageData) {
+      if (text || imageKey || imageData) {
         const stored = text
-          || (imageMime && imageMime.startsWith("image/") ? "[shared a photo]" : imageData ? "[shared a file]" : "");
-        await addLine(speaker, stored, imageMime, imageData);
+          || (imageMime && imageMime.startsWith("image/")
+            ? "[shared a photo]"
+            : (imageKey || imageData) ? "[shared a file]" : "");
+        await addLine(speaker, stored, imageMime, imageData, imageKey);
       }
       if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
       return new Response("ok", { status: 200 });
