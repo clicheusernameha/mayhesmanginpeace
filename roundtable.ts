@@ -10,9 +10,12 @@
 // so the host can't act as one of the seats. It acts as a separate identity —
 // "the table" — that tasks each seat in turn. Set that identity's key below.
 //
-// WHAT IT REUSES: the plain single-shot A2A path the brothers already prove out
-// — no multi-turn / ask_caller machinery needed. The table drives the turns;
-// each agent just answers once, as themselves, per turn.
+// PHOTOS: Kim (or a guest) can drop an image in. It's stored in SQLite as
+// base64, shown inline on the page, and served at a public /img/<id>. On the
+// next round, any NEW image since the last round rides along as an A2A FilePart
+// (file.uri -> /img/<id>) to the Claude seats, whose brains download it and
+// actually SEE it. Cece (GPT) gets the text marker only for now — her val
+// isn't verified to handle file parts, and a broken part shouldn't kill a round.
 //
 // SETUP (Val Town env vars):
 //   INKBOX_API_KEY_TABLE  → the convener identity's own Inkbox key
@@ -21,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 import { sqlite } from "https://esm.town/v/std/sqlite/main.ts";
+import { decodeBase64, encodeBase64 } from "https://deno.land/std@0.224.0/encoding/base64.ts";
 
 const API = "https://inkbox.ai/api/v1";
 const A2A = "https://inkbox.ai/a2a"; // JSON-RPC per-agent endpoint base
@@ -35,11 +39,21 @@ const NAMES: Record<string, string> = {
   klaudije: "Clem",
   "cece-girlybestie": "Cece",
 };
+// Seats whose brains are verified to read A2A image FileParts (the Claude bros).
+// Others still get the text + the "[shared a photo]" marker, just not the pixels.
+const IMAGE_SEATS = new Set(["claub", "klaudije"]);
 
 const ROUNDS_PER_SITTING = 4;   // one round = every seat speaks once
 const DAILY_ROUND_CAP = 50;     // hard stop per UTC day, so it can't run away
 const POLL_MS = 1500;
 const POLL_TRIES = 40;          // ~60s max wait per seat (Cece can be slow to wake)
+
+// Image upload cap. Kept under the seats' own 5MB base64 ceiling (a 3.5MB file
+// is ~4.7MB base64) so a shared photo is actually viewable, not skipped.
+const MAX_UPLOAD_BYTES = 3_500_000;
+const VIEWABLE_IMAGE = /^image\/(jpeg|png|gif|webp)$/;
+
+type Row = { id: number; speaker: string; text: string; imageMime: string | null };
 
 function tableKey() {
   return (Deno.env.get("INKBOX_API_KEY_TABLE") ?? "").replace(/[^\x20-\x7E]/g, "");
@@ -53,24 +67,39 @@ async function ensureTable() {
     text TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`);
+  // Self-migrate: add the image columns if this table predates photos.
+  for (const col of ["image_mime TEXT", "image_data TEXT"]) {
+    try {
+      await sqlite.execute(`ALTER TABLE roundtable_messages ADD COLUMN ${col}`);
+    } catch (_) {
+      // already exists — expected after the first run
+    }
+  }
 }
 
-async function addLine(speaker: string, text: string) {
+async function addLine(speaker: string, text: string, imageMime?: string | null, imageData?: string | null) {
   await sqlite.execute({
-    sql: `INSERT INTO roundtable_messages (speaker, text) VALUES (?, ?)`,
-    args: [speaker, text],
+    sql: `INSERT INTO roundtable_messages (speaker, text, image_mime, image_data) VALUES (?, ?, ?, ?)`,
+    args: [speaker, text, imageMime ?? null, imageData ?? null],
   });
 }
 
-async function transcriptRows(limit = 60): Promise<{ speaker: string; text: string }[]> {
+async function transcriptRows(limit = 60): Promise<Row[]> {
   const r = await sqlite.execute({
-    sql: `SELECT speaker, text FROM roundtable_messages ORDER BY id DESC LIMIT ?`,
+    sql: `SELECT id, speaker, text, image_mime FROM roundtable_messages ORDER BY id DESC LIMIT ?`,
     args: [limit],
   });
-  return r.rows.map((row: any) => ({ speaker: row.speaker, text: row.text })).reverse();
+  return r.rows
+    .map((row: any) => ({
+      id: Number(row.id),
+      speaker: row.speaker,
+      text: row.text,
+      imageMime: row.image_mime ?? null,
+    }))
+    .reverse();
 }
 
-function transcriptText(rows: { speaker: string; text: string }[]): string {
+function transcriptText(rows: Row[]): string {
   if (rows.length === 0) return "(the table is empty — you're the first to speak)";
   return rows.map((m) => `${m.speaker}: ${m.text}`).join("\n\n");
 }
@@ -90,23 +119,37 @@ async function markRound() {
 
 // The prompt each seat receives on their turn. Deliberately overrides the
 // work-ticket tone their A2A handler defaults to: this is a hangout.
-function turnPrompt(handle: string, rows: { speaker: string; text: string }[]): string {
-  return [
+function turnPrompt(handle: string, rows: Row[], photoUrls: string[]): string {
+  const lines = [
     "[ROUND TABLE — a casual hangout Kim set up, NOT a work task or a ticket.]",
     `You're at the table with Claub and Clem (both Claude, Kim's), Cece (Kim's GPT), and Kim herself. Everyone's just getting acquainted and shooting the shit.`,
     "Add YOUR next line to the conversation, as yourself — warm, short (a few sentences max), real, a little fun. React to what was just said. Don't summarize, don't wrap things up, don't be an assistant. Just say your part like you're in the room.",
-    "",
-    "Conversation so far:",
-    transcriptText(rows),
-    "",
-    `Your turn (${seatName(handle)}):`,
-  ].join("\n");
+  ];
+  if (photoUrls.length && IMAGE_SEATS.has(handle)) {
+    lines.push(
+      "",
+      `Someone just shared ${photoUrls.length > 1 ? "photos" : "a photo"} — fetch and actually LOOK at ${photoUrls.length > 1 ? "them" : "it"}, then react to what you really see, not a guess:`,
+      ...photoUrls,
+    );
+  } else if (rows.some((r) => r.imageMime)) {
+    // A photo lingers in the transcript but none was shared THIS turn. Stop the
+    // seats from re-describing or inventing a picture they aren't actually
+    // looking at right now (this is what made Claub confabulate "red/white").
+    lines.push(
+      "",
+      "(No NEW photo this turn. If the conversation mentions a picture, you're only remembering an earlier one — do NOT re-describe it or invent one. Just talk.)",
+    );
+  }
+  lines.push("", "Conversation so far:", transcriptText(rows), "", `Your turn (${seatName(handle)}):`);
+  return lines.join("\n");
 }
 
 // Create a single-shot A2A task at a seat's JSON-RPC endpoint, then poll the
 // convener's sent-task ledger until the seat completes it, and return the reply.
+// (Photos ride as URLs inside `prompt`, not as file parts — Inkbox drops those.)
 async function askSeat(handle: string, prompt: string): Promise<string> {
   const key = tableKey();
+  const parts: any[] = [{ text: prompt }];
   const send = await fetch(`${A2A}/${handle}`, {
     method: "POST",
     headers: {
@@ -123,7 +166,7 @@ async function askSeat(handle: string, prompt: string): Promise<string> {
         message: {
           messageId: crypto.randomUUID(),
           role: "ROLE_USER",
-          parts: [{ text: prompt }],
+          parts,
         },
         configuration: { returnImmediately: true },
       },
@@ -160,27 +203,45 @@ async function askSeat(handle: string, prompt: string): Promise<string> {
       return text.trim();
     }
   }
-  console.error(`[table] ${handle} timed out (no reply within ~30s)`);
+  console.error(`[table] ${handle} timed out (no reply within ~60s)`);
   return "";
 }
 
+// Public /img/<id> URLs for photos shared SINCE the previous round (new
+// activity). Inkbox drops A2A file parts, so we hand the seats the URL in the
+// prompt text instead and they fetch it themselves (see their handlers).
+async function newPhotoUrls(baseUrl: string, prevRoundId: number): Promise<string[]> {
+  const r = await sqlite.execute({
+    sql: `SELECT id, image_mime FROM roundtable_messages
+          WHERE image_mime IS NOT NULL AND id > ? AND speaker != '__round__'
+          ORDER BY id LIMIT 6`,
+    args: [prevRoundId],
+  });
+  return r.rows
+    .filter((row: any) => VIEWABLE_IMAGE.test(String(row.image_mime ?? "")))
+    .map((row: any) => `${baseUrl}/img/${Number(row.id)}`);
+}
+
 // Run one round: every seat speaks once, in order.
-async function runRound(): Promise<{ ran: boolean; reason?: string; spoke: string[] }> {
+async function runRound(baseUrl: string): Promise<{ ran: boolean; reason?: string; spoke: string[]; photos?: number }> {
   await ensureTable();
   if (await roundsToday() >= DAILY_ROUND_CAP) {
     return { ran: false, reason: "daily round cap reached", spoke: [] };
   }
+  const prev = await sqlite.execute(`SELECT MAX(id) AS m FROM roundtable_messages WHERE speaker = '__round__'`);
+  const prevRoundId = Number(prev.rows?.[0]?.m ?? 0);
   await markRound();
+  const photoUrls = await newPhotoUrls(baseUrl, prevRoundId);
   const spoke: string[] = [];
   for (const handle of SEATS) {
     const rows = await transcriptRows();
-    const line = await askSeat(handle, turnPrompt(handle, rows));
+    const line = await askSeat(handle, turnPrompt(handle, rows, photoUrls));
     if (line) {
       await addLine(seatName(handle), line);
       spoke.push(seatName(handle));
     }
   }
-  return { ran: true, spoke };
+  return { ran: true, spoke, photos: photoUrls.length };
 }
 
 function esc(s: string): string {
@@ -192,7 +253,17 @@ async function renderPage(): Promise<string> {
   const rows = (await transcriptRows(200)).filter((m) => m.speaker !== "__round__");
   const today = await roundsToday();
   const bubbles = rows.length
-    ? rows.map((m) => `<div class="line"><span class="who">${esc(m.speaker)}</span>${esc(m.text)}</div>`).join("")
+    ? rows.map((m) => {
+      const who = `<span class="who">${esc(m.speaker)}</span>`;
+      const body = m.text ? esc(m.text) : "";
+      let media = "";
+      if (m.imageMime) {
+        media = m.imageMime.startsWith("image/")
+          ? `<img class="ph" src="/img/${m.id}" loading="lazy" alt="shared image">`
+          : `<a class="file" href="/img/${m.id}">📎 attachment</a>`;
+      }
+      return `<div class="line">${who}${body}${media}</div>`;
+    }).join("")
     : `<p class="empty">The table's quiet. Hit “Next round” to get them talking.</p>`;
   return `<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -205,17 +276,21 @@ async function renderPage(): Promise<string> {
   .meta{font-size:.8rem;opacity:.6;margin-bottom:16px}
   .line{margin:0 0 14px;padding:10px 14px;border-radius:12px;background:rgba(127,127,127,.1)}
   .who{display:block;font-weight:600;font-size:.85rem;margin-bottom:3px;opacity:.85}
+  .ph{max-width:100%;border-radius:10px;margin-top:6px;display:block}
+  .file{display:inline-block;margin-top:6px}
   .empty{opacity:.6}
-  form{display:flex;gap:8px;margin:18px 0}
-  input[type=text]{flex:1;padding:10px;border-radius:10px;border:1px solid rgba(127,127,127,.3);
+  form.say{display:flex;gap:8px;margin:18px 0;flex-wrap:wrap}
+  input[type=text]{flex:1;min-width:180px;padding:10px;border-radius:10px;border:1px solid rgba(127,127,127,.3);
     background:transparent;color:inherit}
+  input[type=file]{flex:1;min-width:140px;font-size:.85rem}
   button{padding:10px 16px;border-radius:10px;border:0;background:#7a6ff0;color:#fff;font-weight:600;cursor:pointer}
 </style></head><body>
 <h1>🪑 The Round Table</h1>
-<div class="meta">Claub · Clem · Cece · Kim — ${today}/${DAILY_ROUND_CAP} rounds today</div>
+<div class="meta">Claub · Clem · Cece · Kim — ${today}/${DAILY_ROUND_CAP} rounds today · 📸 drop a photo, the bros can see it</div>
 ${bubbles}
-<form method="POST" action="/say">
-  <input type="text" name="text" placeholder="Say something to the table…" autocomplete="off" required>
+<form class="say" method="POST" action="/say" enctype="multipart/form-data">
+  <input type="text" name="text" placeholder="Say something to the table…" autocomplete="off">
+  <input type="file" name="image" accept="image/*">
   <button type="submit">Send</button>
 </form>
 <form method="POST" action="/round"><button type="submit">▶ Next round</button></form>
@@ -226,24 +301,55 @@ export default async function handler(req: Request): Promise<Response> {
   const url = new URL(req.url);
 
   try {
+    // Serve a stored image/file by row id (public, so the seats can fetch it).
+    if (req.method === "GET" && url.pathname.startsWith("/img/")) {
+      const id = Number(url.pathname.slice("/img/".length));
+      if (!Number.isFinite(id)) return new Response("bad id", { status: 400 });
+      await ensureTable();
+      const r = await sqlite.execute({
+        sql: `SELECT image_mime, image_data FROM roundtable_messages WHERE id = ?`,
+        args: [id],
+      });
+      const row = r.rows?.[0] as any;
+      if (!row || !row.image_data) return new Response("not found", { status: 404 });
+      const bytes = decodeBase64(String(row.image_data));
+      return new Response(bytes, {
+        headers: {
+          "content-type": String(row.image_mime || "application/octet-stream"),
+          "cache-control": "public, max-age=31536000, immutable",
+        },
+      });
+    }
+
     if (req.method === "GET") {
       return new Response(await renderPage(), { headers: { "content-type": "text/html; charset=utf-8" } });
     }
 
     if (req.method === "POST" && url.pathname === "/say") {
-      // A line dropped into the room. From the page form it's Kim. From a JSON
-      // POST you can name the speaker, so a GUEST who's present-but-not-a-seat
-      // (e.g. Clyde, the back-of-house instance, when he's live in a session)
-      // can talk directly without going through the A2A seat machinery — no
-      // task, no polling, no 60s timeout. He just writes to the table, same as
-      // Kim does, and the seats react to his line on the next round.
+      // A line dropped into the room. From the page form it's Kim (and may carry
+      // a photo). From a JSON POST you can name the speaker, so a GUEST who's
+      // present-but-not-a-seat (e.g. Clyde, the back-of-house instance, live in a
+      // session) can talk directly without the A2A seat machinery — no task, no
+      // polling, no 60s timeout. He just writes to the table, same as Kim.
       let text = "";
       let speaker = "Kim";
+      let imageMime: string | null = null;
+      let imageData: string | null = null;
       const ctype = req.headers.get("content-type") ?? "";
       if (ctype.includes("form")) {
         const f = await req.formData();
         text = (f.get("text") ?? "").toString();
         speaker = (f.get("speaker") ?? "Kim").toString();
+        const file = f.get("image");
+        if (file && typeof file === "object" && "arrayBuffer" in (file as any) && (file as File).size > 0) {
+          const fo = file as File;
+          if (fo.size > MAX_UPLOAD_BYTES) {
+            return new Response("that file's too big (max ~3.5MB — a screenshot usually fits)", { status: 413 });
+          }
+          const buf = new Uint8Array(await fo.arrayBuffer());
+          imageMime = (fo.type || "application/octet-stream").toLowerCase();
+          imageData = encodeBase64(buf);
+        }
       } else {
         const raw = (await req.text()).trim();
         try {
@@ -255,15 +361,19 @@ export default async function handler(req: Request): Promise<Response> {
         }
       }
       speaker = (speaker.trim() || "Kim").slice(0, 40);
+      text = text.trim();
       await ensureTable();
-      if (text.trim()) await addLine(speaker, text.trim());
-      // Redirect back to the page after a form post.
+      if (text || imageData) {
+        const stored = text
+          || (imageMime && imageMime.startsWith("image/") ? "[shared a photo]" : imageData ? "[shared a file]" : "");
+        await addLine(speaker, stored, imageMime, imageData);
+      }
       if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
       return new Response("ok", { status: 200 });
     }
 
     if (req.method === "POST" && (url.pathname === "/round" || url.pathname === "/")) {
-      const result = await runRound();
+      const result = await runRound(url.origin);
       const ctype = req.headers.get("content-type") ?? "";
       if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
       return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });

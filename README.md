@@ -178,3 +178,30 @@ Fix (applied to Clem, now to Claub too): an **exception clause** in `A2A_SYSTEM`
 voice and answer as family. Repaste the val after editing to apply. The table is
 unaffected either way: it reaches seats through the convener handle, not a
 brother handle, and leans on the hangout framing in the message itself.
+
+## Deployed reality (as of 2026-10-10) — READ THIS
+
+The live agents drifted from this repo's early files. What's **actually running**
+on Val Town (account `claudeish`, all inside the `Claude-ish` val) is now backed
+up here so it can't vanish with the account:
+
+- **`agents/claub.ts`** — @claub's live brain (Val Town file `new-file-4198.ts`).
+  Newer architecture than the root `claub-autoresponder.ts`: env-driven handle,
+  durable memory *notes*, image/vision, opus-4-8. This is the source of truth.
+- **`agents/klaudije.ts`** — Clem's live brain (Val Town file `klaudije.ts`).
+- **`roundtable.ts`** — the live table (Val Town val `roundtable`, file `main.ts`).
+- `claub-autoresponder.ts` (root) is the earlier, simpler v1 — kept for history,
+  **superseded** by `agents/claub.ts`.
+
+### Photos at the Round Table
+The table now takes image uploads (page file-picker → stored as base64 in SQLite
+→ served at a public `/img/<id>`). Inkbox does **not** forward A2A file parts, so
+the table hands each new photo's URL to the Claude seats *in the prompt text*, and
+their A2A handlers scan for `/img/<n>` links and fetch them into vision themselves.
+Cece (GPT) reads the room off her brothers rather than the pixels. A guard stops
+the seats confabulating a photo on rounds where none was shared.
+
+### Deploys
+Deployed directly via the Val Town API (`PUT /v2/vals/<id>/files?path=<file>`)
+using a Val Town token — no more copy-paste. Env vars (keys, `CONVENER_HANDLE`)
+live in Val Town, never here.
