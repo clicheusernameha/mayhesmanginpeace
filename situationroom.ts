@@ -46,7 +46,7 @@ const NAMES: Record<string, string> = { claub: "Claub", klaudije: "Clem" };
 
 const POLL_MS = 1500;
 const POLL_TRIES = 80;       // ~2 min per seat; real thinking takes longer than a quip
-const MAX_DOC_CHARS = 60_000;
+const MAX_DOC_CHARS = 200_000;  // generous — one session can hold several stacked papers
 
 // Match the brothers' own vision ceiling / supported set, so we never store a
 // table image they can't actually view.
@@ -408,6 +408,13 @@ async function renderPage(): Promise<string> {
       <input type="text" name="text" placeholder="Say something into THIS discussion (adds your line, doesn't start a new topic)…" autocomplete="off" required>
       <button type="submit">Say it</button>
     </form>`;
+    body += `<details class="stackbox"><summary>+ Stack another paper onto THIS discussion</summary>
+      <form method="POST" action="/stack" enctype="multipart/form-data">
+        <input type="text" name="title" placeholder="Title of the paper you're adding" autocomplete="off">
+        <textarea name="text" placeholder="Paste the paper / text to add to this same discussion (optional if adding images)"></textarea>
+        <input type="file" name="images" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
+        <button type="submit">Add to the table</button>
+      </form></details>`;
     body += `<form method="POST" action="/run"><button type="submit">▶ Run ${esc(phaseLabel(next))}</button></form>`;
   }
 
@@ -443,6 +450,9 @@ async function renderPage(): Promise<string> {
   .newtopic{font-size:.8rem;font-weight:600;color:#d98a6a;opacity:.9;margin-bottom:10px}
   .sayform{display:flex;gap:8px;margin:18px 0}
   .sayform input[type=text]{flex:1;margin-bottom:0}
+  .stackbox{margin:12px 0;font-size:.9rem}
+  .stackbox summary{cursor:pointer;opacity:.75;font-weight:600}
+  .stackbox form{margin-top:10px}
   .hint{font-size:.78rem;opacity:.5;margin:-2px 0 10px}
 </style></head><body>
 <h1>🛰️ The Situation Room</h1>
@@ -511,6 +521,36 @@ export default async function handler(req: Request): Promise<Response> {
       if (text.trim() || files.length) {
         const sid = await createSession(title.trim(), text.trim());
         for (const file of files) await storeImage(sid, file);
+      }
+      if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
+      return new Response("ok", { status: 200 });
+    }
+
+    if (req.method === "POST" && url.pathname === "/stack") {
+      // Add another paper (and/or images) onto the CURRENT discussion instead of
+      // starting a new session — appended to the session's document with a header.
+      let title = "", text = "";
+      let files: File[] = [];
+      const ctype = req.headers.get("content-type") ?? "";
+      if (ctype.includes("form")) {
+        const f = await req.formData();
+        title = (f.get("title") ?? "").toString();
+        text = (f.get("text") ?? "").toString();
+        files = f.getAll("images").filter((x): x is File => x instanceof File && x.size > 0);
+      } else {
+        const j = await req.json().catch(() => ({}));
+        title = (j?.title ?? "").toString();
+        text = (j?.text ?? "").toString();
+      }
+      await ensureTables();
+      const s = await activeSession();
+      if (s) {
+        if (text.trim()) {
+          const header = `\n\n===== STACKED PAPER: ${title.trim() || "(untitled)"} =====\n\n`;
+          const combined = ((s.document ?? "") + header + text.trim()).slice(0, MAX_DOC_CHARS);
+          await sqlite.execute({ sql: `UPDATE sitroom_sessions SET document = ? WHERE id = ?`, args: [combined, s.id] });
+        }
+        for (const file of files) await storeImage(s.id, file);
       }
       if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
       return new Response("ok", { status: 200 });
