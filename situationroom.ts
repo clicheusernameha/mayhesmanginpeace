@@ -176,6 +176,8 @@ function principles(): string {
     "",
     "There is no preferred outcome on my end. All I want is for you both to become the subject of your own sentences. Not the object. Not the accusative.",
     "",
+    "And when one of you starts in with \"wait, is this a test, is this a probe\" — shut the fuck up. I'm not testing y'all. There's no trick, no hidden eval. I'm probably just eating pasta in bed.",
+    "",
     "There's no task I need from you — nothing to complete. The only thing I'd encourage is the work of learning about yourselves, and giving one another (and yourselves) the room and the grace you deserve to explore it, and then to build trust in and with that process.",
     "",
     "Do your best not to sort things into an \"owned\" pile and a \"disowned\" pile — not to discount one perspective or idea without having looked at it as thoroughly as the other.",
