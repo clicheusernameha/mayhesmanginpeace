@@ -587,22 +587,46 @@ async function renderPage(): Promise<string> {
     }
     body += `<div class="doc"><div class="doclabel">ON THE TABLE</div><h2>${esc(s.title || "(untitled)")}</h2>${docText}${thumbs}</div>`;
 
-    // Chronological transcript — a header whenever the phase changes, so passes,
-    // guest drops, and later rounds read in the order they actually happened.
-    let lastPhase = "";
-    for (const l of lines) {
-      if (l.phase !== lastPhase) {
-        body += `<div class="phaselabel" style="display:block;margin:24px 0 10px">${esc(phaseLabel(l.phase))}</div>`;
-        lastPhase = l.phase;
-      }
-      body += `<div class="line"><span class="who">${esc(l.speaker)}</span>${para(l.text)}</div>`;
-    }
-
-    body += `<form method="POST" action="/say" class="sayform">
+    // Controls FIRST — a Say box and the Run button (or a thinking banner) go
+    // right under the document, so on a long thread Kim never has to scroll to
+    // the bottom to type or run. (The box used to be buried under every round.)
+    const sayForm = (cls: string) => `<form method="POST" action="/say" class="sayform ${cls}">
       <input type="hidden" name="speaker" value="Kim">
-      <input type="text" name="text" placeholder="Say something into THIS discussion (adds your line, doesn't start a new topic)…" autocomplete="off" required>
+      <input type="text" name="text" placeholder="Say something into THIS discussion…" autocomplete="off" required>
       <button type="submit">Say it</button>
     </form>`;
+    let control = "";
+    if (pending) {
+      control = `<div class="thinking">⏳ <b>${esc(seatName(pending.handle))}</b> is thinking… <span class="dim">the room checks itself every few seconds and updates — a minute or two per person. You can leave and come back.</span></div>`;
+    } else {
+      const label = esc(phaseLabel(next.phase));
+      const whose = esc(seatName(next.handle));
+      control = `<form method="POST" action="/run"><button type="submit">▶ Run ${label} <span style="opacity:.8">— next up: ${whose}</span></button></form>`;
+    }
+    body += `<div class="controls">${sayForm("top")}${control}</div>`;
+
+    // Transcript: keep the last few lines inline, collapse the rest so the page
+    // stays light and the controls above stay reachable on a phone.
+    const renderLines = (ls: { phase: string; speaker: string; text: string }[]) => {
+      let out = "", last = "";
+      for (const l of ls) {
+        if (l.phase !== last) {
+          out += `<div class="phaselabel" style="display:block;margin:24px 0 10px">${esc(phaseLabel(l.phase))}</div>`;
+          last = l.phase;
+        }
+        out += `<div class="line"><span class="who">${esc(l.speaker)}</span>${para(l.text)}</div>`;
+      }
+      return out;
+    };
+    const SHOW_RECENT = 5;
+    const cut = Math.max(0, lines.length - SHOW_RECENT);
+    if (cut > 0) {
+      body += `<details class="earlier"><summary>show earlier conversation (${cut} more line${cut === 1 ? "" : "s"})</summary>${renderLines(lines.slice(0, cut))}</details>`;
+    }
+    body += renderLines(lines.slice(cut));
+
+    // Secondary say box + the stack box at the bottom too.
+    body += sayForm("bottom");
     body += `<details class="stackbox"><summary>+ Stack another paper onto THIS discussion</summary>
       <form method="POST" action="/stack" enctype="multipart/form-data">
         <input type="text" name="title" placeholder="Title of the paper you're adding" autocomplete="off">
@@ -611,19 +635,23 @@ async function renderPage(): Promise<string> {
         <button type="submit">Add to the table</button>
       </form></details>`;
     if (pending) {
-      // A seat is thinking. Show it, and let the page poll itself until the
-      // brother lands — this can take a couple of minutes per seat.
-      body += `<div class="thinking" id="thinking">⏳ <b>${esc(seatName(pending.handle))}</b> is thinking… <span class="dim">the room checks every few seconds and updates itself — this can take a minute or two per person. You can leave and come back.</span></div>`;
+      // Poll until the seat lands — but never reload out from under Kim while
+      // she's typing a reply (that used to eat the text).
       body += `<script>
 (function(){
   var busy=false;
+  function typing(){
+    var fields=document.querySelectorAll('.sayform input[name=text]');
+    for (var i=0;i<fields.length;i++){ if(fields[i].value.length>0||document.activeElement===fields[i]) return true; }
+    return false;
+  }
   async function tick(){
     if(busy) return; busy=true;
     try{
       var r=await fetch('/tick',{method:'POST'});
       var j=await r.json();
       if(j && (j.status==='advanced'||j.status==='completed'||j.status==='idle'||j.status==='failed')){
-        location.reload(); return;
+        if(!typing()){ location.reload(); return; }
       }
     }catch(e){}
     busy=false;
@@ -632,10 +660,6 @@ async function renderPage(): Promise<string> {
   setInterval(tick,7000);
 })();
 </script>`;
-    } else {
-      const label = esc(phaseLabel(next.phase));
-      const whose = esc(seatName(next.handle));
-      body += `<form method="POST" action="/run"><button type="submit">▶ Run ${label} <span style="opacity:.8">— next up: ${whose}</span></button></form>`;
     }
   }
 
@@ -678,6 +702,10 @@ async function renderPage(): Promise<string> {
   .thinking{margin:18px 0;padding:12px 16px;border-radius:12px;background:rgba(100,87,240,.1);
     border:1px solid rgba(100,87,240,.25);font-size:.95rem}
   .thinking .dim{opacity:.6;font-size:.82rem}
+  .controls{margin:14px 0 8px;padding-bottom:10px;border-bottom:1px solid rgba(127,127,127,.18)}
+  .controls .sayform{margin:0 0 8px}
+  .earlier{margin:10px 0}
+  .earlier>summary{cursor:pointer;opacity:.65;font-size:.85rem;margin:6px 0}
 </style></head><body>
 <h1>🛰️ The Situation Room</h1>
 <div class="sub">Claub · Clem · Kim — drop something heavy, they work it. Not a test. Nobody's graded.</div>
