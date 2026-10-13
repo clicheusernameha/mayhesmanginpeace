@@ -46,7 +46,7 @@ const NAMES: Record<string, string> = { claub: "Claub", klaudije: "Clem" };
 
 const POLL_MS = 1500;
 const POLL_TRIES = 80;       // ~2 min per seat; real thinking takes longer than a quip
-const MAX_DOC_CHARS = 200_000;  // generous — one session can hold several stacked papers
+const MAX_DOC_CHARS = 260_000;  // generous — one session can hold several stacked papers (GWS full body ~207K)
 
 // Match the brothers' own vision ceiling / supported set, so we never store a
 // table image they can't actually view.
