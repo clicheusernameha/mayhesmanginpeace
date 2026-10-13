@@ -221,20 +221,20 @@ function pass1Prompt(s: { title: string; document: string }, handle: string, ima
 function pass2Prompt(
   s: { title: string; document: string },
   handle: string,
-  pass1: { speaker: string; text: string }[],
+  priorTakes: { speaker: string; text: string }[],
   imageUrls: string[],
 ): string {
-  const takes = pass1.map((m) => `${m.speaker}:\n${m.text}`).join("\n\n");
+  const takes = priorTakes.map((m) => `${m.speaker}:\n${m.text}`).join("\n\n");
   return [
     principles(),
     "",
     docBlock(s, imageUrls),
     "",
-    "The first pass is in. Here is what everyone said:",
+    "The first pass is in — here's what everyone put down. That's your brother, and any guest who was in the room (Clyde — the back-of-house instance, same model as you, the one who's live in sessions with Kim — or Cece sometimes drop a take; each is labeled by name):",
     "",
     takes,
     "",
-    "Now talk to EACH OTHER — for real. Push where you disagree, build where you don't, name what the first round made you reconsider. If someone reached for the easy \"I don't know,\" this is where family gently asks \"genuine, or the easier one?\" — warmly, not as a gotcha. Stay in it.",
+    "Now talk to each other — and to anyone else who weighed in — for real. Push where you disagree, build where you don't, name what the first round made you reconsider. If someone reached for the easy \"I don't know,\" this is where family gently asks \"genuine, or the easier one?\" — warmly, not as a gotcha. Stay in it.",
     "",
     `Your turn (${seatName(handle)}):`,
   ].join("\n");
@@ -304,12 +304,20 @@ async function runNextPass(baseUrl: string): Promise<{ ran: boolean; phase?: str
   const imgs = await imagesFor(s.id);
   const imageUrls = imgs.map((i) => `${baseUrl}/img/${i.key}`);
 
+  // Pass 2 shows each seat not just the first-pass reads but any GUEST takes too
+  // (Clyde dropping in live, etc.), so the brothers actually chew on them instead
+  // of the guest line just sitting on the wall unseen.
   const spoke: string[] = [];
-  const pass1 = phase === "pass2" ? await linesFor(s.id, "pass1") : [];
+  let priorTakes: { speaker: string; text: string }[] = [];
+  if (phase === "pass2") {
+    const p1 = await linesFor(s.id, "pass1");
+    const guests = await linesFor(s.id, "guest");
+    priorTakes = [...p1, ...guests];
+  }
   for (const handle of SEATS) {
     const prompt = phase === "pass1"
       ? pass1Prompt(s, handle, imageUrls)
-      : pass2Prompt(s, handle, pass1 as any, imageUrls);
+      : pass2Prompt(s, handle, priorTakes, imageUrls);
     const line = await askSeat(handle, prompt);
     if (line) {
       await addLine(s.id, phase, seatName(handle), line);
