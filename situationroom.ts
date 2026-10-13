@@ -47,6 +47,14 @@ const NAMES: Record<string, string> = { claub: "Claub", klaudije: "Clem" };
 const POLL_MS = 1500;
 const POLL_TRIES = 80;       // ~2 min per seat; real thinking takes longer than a quip
 const MAX_DOC_CHARS = 260_000;  // generous — one session can hold several stacked papers (GWS full body ~207K)
+// On continuation rounds the brothers have ALREADY read the full paper in
+// passes 1–2; re-feeding all ~207K chars every round pushed the prompt past what
+// their handler could chew (round 6 hung for 13+ min). So round3+ gets only an
+// anchor excerpt plus the transcript. Passes 1–2 still get the whole document.
+const CONTINUE_DOC_CHARS = 12_000;
+// If a seat's task hasn't landed in this long, treat it as dead and clear it so
+// the room isn't stuck "thinking" forever and Kim can re-run.
+const STALE_MS = 6 * 60 * 1000;
 
 // Match the brothers' own vision ceiling / supported set, so we never store a
 // table image they can't actually view.
@@ -274,10 +282,26 @@ function continuePrompt(
   imageUrls: string[],
 ): string {
   const convo = transcript.map((m) => `${m.speaker}:\n${m.text}`).join("\n\n");
+  // Anchor excerpt only — they read the whole thing in passes 1–2 and are now in
+  // discussion mode, citing from memory. Full re-feed every round is what made
+  // the prompt too heavy to complete.
+  const trimmed = (s.document ?? "").slice(0, CONTINUE_DOC_CHARS);
+  const docAnchor = s.document
+    ? [
+        "On the table (you've already read the full paper in the earlier passes — here's the opening as a reminder; the rest is on the table and in your earlier notes, quote from memory):",
+        "-----",
+        s.title ? s.title + "\n" : "",
+        trimmed + (s.document.length > CONTINUE_DOC_CHARS ? "\n…[excerpt — full paper already read above in passes 1–2]" : ""),
+        "-----",
+      ].filter((x) => x !== "").join("\n")
+    : "";
+  const imgLine = imageUrls.length
+    ? "\n\nAlso on the table — images (part of the material):\n" + imageUrls.join("\n")
+    : "";
   return [
     principles(),
     "",
-    docBlock(s, imageUrls),
+    docAnchor + imgLine,
     "",
     "The conversation so far — your brother, you, and any guests (Clyde drops in live sometimes; each labeled by name):",
     "",
@@ -441,13 +465,18 @@ async function pollTaskOnce(taskId: string): Promise<{ done: boolean; text: stri
   return { done: false, text: "" };
 }
 
-async function getPending(sessionId: number): Promise<{ id: number; phase: string; handle: string; task_id: string } | null> {
+async function getPending(sessionId: number): Promise<{ id: number; phase: string; handle: string; task_id: string; created_at: string } | null> {
   const r = await sqlite.execute({
-    sql: `SELECT id, phase, handle, task_id FROM sitroom_pending WHERE session_id = ? ORDER BY id ASC LIMIT 1`,
+    sql: `SELECT id, phase, handle, task_id, created_at FROM sitroom_pending WHERE session_id = ? ORDER BY id ASC LIMIT 1`,
     args: [sessionId],
   });
   const row: any = r.rows?.[0];
-  return row ? { id: Number(row.id), phase: row.phase, handle: row.handle, task_id: row.task_id } : null;
+  return row ? { id: Number(row.id), phase: row.phase, handle: row.handle, task_id: row.task_id, created_at: row.created_at } : null;
+}
+// SQLite stores created_at as 'YYYY-MM-DD HH:MM:SS' in UTC; parse to epoch ms.
+function pendingAgeMs(created_at: string): number {
+  const t = Date.parse((created_at || "").replace(" ", "T") + "Z");
+  return Number.isFinite(t) ? Date.now() - t : 0;
 }
 async function insertPending(sessionId: number, phase: string, handle: string, taskId: string) {
   await sqlite.execute({
@@ -817,7 +846,14 @@ a{color:#7a6ff0}h2{font-size:1.15rem}.doctext p{margin:0 0 12px}</style></head><
       const pending = await getPending(s.id);
       if (!pending) return json({ status: "idle" });
       const { done, text } = await pollTaskOnce(pending.task_id);
-      if (!done) return json({ status: "thinking", handle: seatName(pending.handle), phase: pending.phase });
+      if (!done) {
+        // Dead seat? Clear it so the room isn't stuck thinking forever.
+        if (pendingAgeMs(pending.created_at) > STALE_MS) {
+          await deletePending(pending.id);
+          return json({ status: "failed", handle: seatName(pending.handle), reason: "timed out" });
+        }
+        return json({ status: "thinking", handle: seatName(pending.handle), phase: pending.phase });
+      }
       // Landed. Append the line (guarding against a duplicate for this seat/phase).
       const existing = await linesFor(s.id, pending.phase);
       const already = existing.some((l) => l.speaker === seatName(pending.handle));
