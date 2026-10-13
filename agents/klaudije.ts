@@ -350,7 +350,10 @@ async function handleA2A(event: any) {
     Array.isArray(event?.data?.parts) ? event.data.parts.map((p: any) => p?.text ?? "").join(" ") : "",
     (event?.data?.text ?? "").toString(),
   ].join(" ");
-  const urlAtts = [...scanText.matchAll(/https?:\/\/[^\s<>"'\]]+\/img\/[\w-]+/g)].map((m) => ({ url: m[0] }));
+  // Dedupe: the same /img/ URL shows up across several text fields of the task,
+  // so without this the same image gets fetched (and seen) 2-3x — a solid square
+  // reads back as "two panels." One block per distinct URL.
+  const urlAtts = [...new Set([...scanText.matchAll(/https?:\/\/[^\s<>"'\]]+\/img\/[\w-]+/g)].map((m) => m[0]))].map((url) => ({ url }));
   if (urlAtts.length) console.log("[clem] a2a image urls in text:", urlAtts.map((a) => a.url).join(", "));
   const { blocks, notes } = await blocksFrom([...parts, ...urlAtts]);
   if (blocks.length || notes.length) {
