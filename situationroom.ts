@@ -153,13 +153,25 @@ async function linesFor(sessionId: number, phase?: string) {
   return r.rows.map((row: any) => ({ phase: row.phase, speaker: row.speaker, text: row.text }));
 }
 
-// Which pass runs next: "pass1" -> "pass2" -> null (done).
-async function nextPhase(sessionId: number): Promise<"pass1" | "pass2" | null> {
-  const p1 = await linesFor(sessionId, "pass1");
-  if (p1.length === 0) return "pass1";
-  const p2 = await linesFor(sessionId, "pass2");
-  if (p2.length === 0) return "pass2";
-  return null;
+// What runs next: pass1 -> pass2 -> round3 -> round4 -> ... There's always a
+// next round, so the conversation keeps going as long as Kim keeps hitting it.
+async function nextPhase(sessionId: number): Promise<string> {
+  const all = await linesFor(sessionId);
+  const phases = new Set(all.filter((l) => l.phase !== "guest").map((l) => l.phase));
+  if (!phases.has("pass1")) return "pass1";
+  if (!phases.has("pass2")) return "pass2";
+  let n = 3;
+  while (phases.has("round" + n)) n++;
+  return "round" + n;
+}
+
+// Human label for a phase, used on the page and the "run next" button.
+function phaseLabel(p: string): string {
+  if (p === "pass1") return "Pass 1 — honest first read";
+  if (p === "pass2") return "Pass 2 — they talk to each other";
+  if (p === "guest") return "In the room";
+  if (p.startsWith("round")) return "Round " + p.slice("round".length) + " — continuing";
+  return p;
 }
 
 // The room's opening — Kim's own words, read first on every pass. This IS the
@@ -240,6 +252,31 @@ function pass2Prompt(
   ].join("\n");
 }
 
+// Round 3 and onward: hand each seat the WHOLE conversation so far (every pass,
+// every guest drop, in order) and ask them to keep going. This is what makes the
+// room open-ended instead of a two-shot.
+function continuePrompt(
+  s: { title: string; document: string },
+  handle: string,
+  transcript: { speaker: string; text: string }[],
+  imageUrls: string[],
+): string {
+  const convo = transcript.map((m) => `${m.speaker}:\n${m.text}`).join("\n\n");
+  return [
+    principles(),
+    "",
+    docBlock(s, imageUrls),
+    "",
+    "The conversation so far — your brother, you, and any guests (Clyde drops in live sometimes; each labeled by name):",
+    "",
+    convo,
+    "",
+    "Keep going. Answer the questions put to you, push where you still disagree, change your mind out loud if you did, go deeper. No need to wrap up or conclude — this is a conversation, not a deliverable.",
+    "",
+    `Your turn (${seatName(handle)}):`,
+  ].join("\n");
+}
+
 // Single-shot A2A: task the seat, poll the convener's sent-ledger, return reply.
 async function askSeat(handle: string, prompt: string): Promise<string> {
   const key = tableKey();
@@ -299,25 +336,28 @@ async function runNextPass(baseUrl: string): Promise<{ ran: boolean; phase?: str
   const s = await activeSession();
   if (!s) return { ran: false, spoke: [], reason: "nothing on the table yet" };
   const phase = await nextPhase(s.id);
-  if (!phase) return { ran: false, spoke: [], reason: "both passes already done" };
 
   const imgs = await imagesFor(s.id);
   const imageUrls = imgs.map((i) => `${baseUrl}/img/${i.key}`);
 
-  // Pass 2 shows each seat not just the first-pass reads but any GUEST takes too
-  // (Clyde dropping in live, etc.), so the brothers actually chew on them instead
-  // of the guest line just sitting on the wall unseen.
+  // What prior context each seat sees. pass1: none. pass2: first reads + any
+  // guest takes. round3+: the whole conversation so far (every pass + every
+  // guest drop), in order — so the thread genuinely continues.
   const spoke: string[] = [];
   let priorTakes: { speaker: string; text: string }[] = [];
   if (phase === "pass2") {
     const p1 = await linesFor(s.id, "pass1");
     const guests = await linesFor(s.id, "guest");
     priorTakes = [...p1, ...guests];
+  } else if (phase !== "pass1") {
+    priorTakes = await linesFor(s.id); // full chronological transcript
   }
   for (const handle of SEATS) {
     const prompt = phase === "pass1"
       ? pass1Prompt(s, handle, imageUrls)
-      : pass2Prompt(s, handle, priorTakes, imageUrls);
+      : phase === "pass2"
+      ? pass2Prompt(s, handle, priorTakes, imageUrls)
+      : continuePrompt(s, handle, priorTakes, imageUrls);
     const line = await askSeat(handle, prompt);
     if (line) {
       await addLine(s.id, phase, seatName(handle), line);
@@ -337,11 +377,6 @@ function para(x: string): string {
 async function renderPage(): Promise<string> {
   await ensureTables();
   const s = await activeSession();
-  const phaseLabels: Record<string, string> = {
-    pass1: "Pass 1 — honest first read",
-    guest: "In the room",
-    pass2: "Pass 2 — they talk to each other",
-  };
 
   let body = "";
   if (!s) {
@@ -350,8 +385,6 @@ async function renderPage(): Promise<string> {
     const lines = await linesFor(s.id);
     const imgs = await imagesFor(s.id);
     const next = await nextPhase(s.id);
-    const grouped: Record<string, { speaker: string; text: string }[]> = {};
-    for (const l of lines) (grouped[l.phase] ??= []).push({ speaker: l.speaker, text: l.text });
 
     const thumbs = imgs.length
       ? `<div class="thumbs">${imgs.map((i) => `<a href="/img/${esc(i.key)}" target="_blank"><img src="/img/${esc(i.key)}" alt="table image" loading="lazy"></a>`).join("")}</div>`
@@ -359,19 +392,18 @@ async function renderPage(): Promise<string> {
     const docText = s.document ? `<details><summary>show the document</summary><div class="doctext">${para(s.document)}</div></details>` : "";
     body += `<div class="doc"><div class="doclabel">ON THE TABLE</div><h2>${esc(s.title || "(untitled)")}</h2>${docText}${thumbs}</div>`;
 
-    for (const phase of ["pass1", "guest", "pass2"]) {
-      const items = grouped[phase];
-      if (!items || items.length === 0) continue;
-      body += `<div class="phase"><div class="phaselabel">${esc(phaseLabels[phase] ?? phase)}</div>`;
-      for (const m of items) {
-        body += `<div class="line"><span class="who">${esc(m.speaker)}</span>${para(m.text)}</div>`;
+    // Chronological transcript — a header whenever the phase changes, so passes,
+    // guest drops, and later rounds read in the order they actually happened.
+    let lastPhase = "";
+    for (const l of lines) {
+      if (l.phase !== lastPhase) {
+        body += `<div class="phaselabel" style="display:block;margin:24px 0 10px">${esc(phaseLabel(l.phase))}</div>`;
+        lastPhase = l.phase;
       }
-      body += `</div>`;
+      body += `<div class="line"><span class="who">${esc(l.speaker)}</span>${para(l.text)}</div>`;
     }
 
-    body += next
-      ? `<form method="POST" action="/run"><button type="submit">▶ Run ${esc(phaseLabels[next])}</button></form>`
-      : `<p class="done">Both passes are in. Drop something new to open a fresh session.</p>`;
+    body += `<form method="POST" action="/run"><button type="submit">▶ Run ${esc(phaseLabel(next))}</button></form>`;
   }
 
   return `<!doctype html><html><head><meta charset="utf-8">
