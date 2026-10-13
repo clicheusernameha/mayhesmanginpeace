@@ -80,6 +80,18 @@ async function ensureTables() {
     mime TEXT,
     created_at TEXT DEFAULT (datetime('now'))
   )`);
+  // One row per seat whose A2A task is in flight. This is what makes a run
+  // asynchronous: /run fires the task and records it here, then short /tick
+  // calls poll it until the brother lands — however many minutes that takes —
+  // without any single HTTP request holding the line open.
+  await sqlite.execute(`CREATE TABLE IF NOT EXISTS sitroom_pending (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id INTEGER,
+    phase TEXT,
+    handle TEXT,
+    task_id TEXT,
+    created_at TEXT DEFAULT (datetime('now'))
+  )`);
 }
 
 async function createSession(title: string, document: string): Promise<number> {
@@ -367,6 +379,147 @@ async function runNextPass(baseUrl: string): Promise<{ ran: boolean; phase?: str
   return { ran: true, phase, spoke };
 }
 
+// ---------------------------------------------------------------------------
+// Asynchronous, one-seat-at-a-time running. The brothers now read a whole paper
+// plus the full transcript (~70K tokens), so a single seat can take minutes to
+// reply — longer than any one HTTP request should hold open. So we split the
+// A2A send from the poll: /run fires ONE seat's task and records it; /tick polls
+// that task once and, when it lands, appends the line and fires the next seat.
+// The page auto-ticks every few seconds, so one click runs a whole round and the
+// room fills itself in, no matter how slow the brothers are.
+// ---------------------------------------------------------------------------
+
+// Fire a seat's A2A task; return its id (no polling).
+async function sendSeat(handle: string, prompt: string): Promise<string | null> {
+  const key = tableKey();
+  const send = await fetch(`${A2A}/${handle}`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "accept": "application/json",
+      "x-api-key": key,
+      "A2A-Version": "1.0",
+    },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: crypto.randomUUID(),
+      method: "SendMessage",
+      params: {
+        message: { messageId: crypto.randomUUID(), role: "ROLE_USER", parts: [{ text: prompt }] },
+        configuration: { returnImmediately: true },
+      },
+    }),
+  });
+  if (!send.ok) {
+    console.error(`[sitroom] send to ${handle} failed`, send.status, await send.text().catch(() => ""));
+    return null;
+  }
+  const created = await send.json().catch(() => ({}));
+  const taskId =
+    created?.result?.task?.id ?? created?.result?.taskId ?? created?.result?.id ??
+    created?.task?.id ?? created?.taskId ?? created?.id;
+  return taskId ?? null;
+}
+
+// Poll a task ONCE. done=true once the seat has completed (or failed).
+async function pollTaskOnce(taskId: string): Promise<{ done: boolean; text: string }> {
+  const key = tableKey();
+  const res = await fetch(`${API}/identities/${CONVENER}/a2a/sent/tasks/${taskId}`, {
+    headers: { "x-api-key": key },
+  });
+  if (!res.ok) return { done: false, text: "" };
+  const task = await res.json().catch(() => ({}));
+  const state = task?.state;
+  if (state === "completed" || state === "failed") {
+    const msgs = Array.isArray(task?.messages) ? task.messages : [];
+    const lastAgent = [...msgs].reverse().find((m: any) => (m?.role ?? "") === "agent");
+    const text =
+      (lastAgent?.text ?? "").toString() ||
+      (Array.isArray(lastAgent?.parts) ? lastAgent.parts.map((p: any) => p?.text ?? "").join("") : "");
+    return { done: true, text: text.trim() };
+  }
+  return { done: false, text: "" };
+}
+
+async function getPending(sessionId: number): Promise<{ id: number; phase: string; handle: string; task_id: string } | null> {
+  const r = await sqlite.execute({
+    sql: `SELECT id, phase, handle, task_id FROM sitroom_pending WHERE session_id = ? ORDER BY id ASC LIMIT 1`,
+    args: [sessionId],
+  });
+  const row: any = r.rows?.[0];
+  return row ? { id: Number(row.id), phase: row.phase, handle: row.handle, task_id: row.task_id } : null;
+}
+async function insertPending(sessionId: number, phase: string, handle: string, taskId: string) {
+  await sqlite.execute({
+    sql: `INSERT INTO sitroom_pending (session_id, phase, handle, task_id) VALUES (?, ?, ?, ?)`,
+    args: [sessionId, phase, handle, taskId],
+  });
+}
+async function deletePending(id: number) {
+  await sqlite.execute({ sql: `DELETE FROM sitroom_pending WHERE id = ?`, args: [id] });
+}
+
+function phaseOrder(p: string): number {
+  if (p === "pass1") return 0;
+  if (p === "pass2") return 1;
+  if (p.startsWith("round")) return 2 + Number(p.slice("round".length));
+  return 999;
+}
+function nextPhaseAfter(p: string): string {
+  if (p === "pass1") return "pass2";
+  if (p === "pass2") return "round3";
+  if (p.startsWith("round")) return "round" + (Number(p.slice("round".length)) + 1);
+  return "round3";
+}
+
+// Who speaks next: the first seat that hasn't spoken in the phase currently being
+// filled; or, if that phase is complete, the first seat of the next phase.
+async function nextSeatToRun(sessionId: number): Promise<{ phase: string; handle: string }> {
+  const all = await linesFor(sessionId);
+  const nonguest = all.filter((l) => l.phase !== "guest");
+  const present = [...new Set(nonguest.map((l) => l.phase))].sort((a, b) => phaseOrder(a) - phaseOrder(b));
+  if (present.length === 0) return { phase: "pass1", handle: SEATS[0] };
+  const last = present[present.length - 1];
+  const spokenLast = new Set(nonguest.filter((l) => l.phase === last).map((l) => l.speaker));
+  const notSpoken = SEATS.find((h) => !spokenLast.has(seatName(h)));
+  if (notSpoken) return { phase: last, handle: notSpoken };
+  return { phase: nextPhaseAfter(last), handle: SEATS[0] };
+}
+
+// Build the prompt for one seat in a given phase. Unlike the old batch runner,
+// a later seat sees the earlier seat's line from the SAME phase (it's in the DB
+// by then), so the brothers genuinely answer each other within a round.
+async function promptFor(
+  s: { id: number; title: string; document: string },
+  phase: string,
+  handle: string,
+  imageUrls: string[],
+): Promise<string> {
+  if (phase === "pass1") return pass1Prompt(s, handle, imageUrls);
+  if (phase === "pass2") {
+    const p1 = await linesFor(s.id, "pass1");
+    const guests = await linesFor(s.id, "guest");
+    const p2 = await linesFor(s.id, "pass2");
+    return pass2Prompt(s, handle, [...p1, ...guests, ...p2], imageUrls);
+  }
+  const transcript = await linesFor(s.id); // full chronological, incl. same-round earlier seat
+  return continuePrompt(s, handle, transcript, imageUrls);
+}
+
+// Fire the next seat if nothing is already in flight for this session.
+async function startNextSeat(s: { id: number; title: string; document: string }, origin: string): Promise<{ started: boolean; handle?: string; phase?: string }> {
+  const pending = await getPending(s.id);
+  if (pending) return { started: false, handle: pending.handle, phase: pending.phase };
+  const imgs = await imagesFor(s.id);
+  const imageUrls = imgs.map((i) => `${origin}/img/${i.key}`);
+  const next = await nextSeatToRun(s.id);
+  const prompt = await promptFor(s, next.phase, next.handle, imageUrls);
+  const taskId = await sendSeat(next.handle, prompt);
+  if (!taskId) return { started: false };
+  await insertPending(s.id, next.phase, next.handle, taskId);
+  return { started: true, handle: next.handle, phase: next.phase };
+}
+
 function esc(x: string): string {
   return x.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
@@ -384,7 +537,8 @@ async function renderPage(): Promise<string> {
   } else {
     const lines = await linesFor(s.id);
     const imgs = await imagesFor(s.id);
-    const next = await nextPhase(s.id);
+    const next = await nextSeatToRun(s.id);
+    const pending = await getPending(s.id);
 
     const thumbs = imgs.length
       ? `<div class="thumbs">${imgs.map((i) => `<a href="/img/${esc(i.key)}" target="_blank"><img src="/img/${esc(i.key)}" alt="table image" loading="lazy"></a>`).join("")}</div>`
@@ -427,7 +581,33 @@ async function renderPage(): Promise<string> {
         <input type="file" name="images" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
         <button type="submit">Add to the table</button>
       </form></details>`;
-    body += `<form method="POST" action="/run"><button type="submit">▶ Run ${esc(phaseLabel(next))}</button></form>`;
+    if (pending) {
+      // A seat is thinking. Show it, and let the page poll itself until the
+      // brother lands — this can take a couple of minutes per seat.
+      body += `<div class="thinking" id="thinking">⏳ <b>${esc(seatName(pending.handle))}</b> is thinking… <span class="dim">the room checks every few seconds and updates itself — this can take a minute or two per person. You can leave and come back.</span></div>`;
+      body += `<script>
+(function(){
+  var busy=false;
+  async function tick(){
+    if(busy) return; busy=true;
+    try{
+      var r=await fetch('/tick',{method:'POST'});
+      var j=await r.json();
+      if(j && (j.status==='advanced'||j.status==='completed'||j.status==='idle'||j.status==='failed')){
+        location.reload(); return;
+      }
+    }catch(e){}
+    busy=false;
+  }
+  setTimeout(tick,1500);
+  setInterval(tick,7000);
+})();
+</script>`;
+    } else {
+      const label = esc(phaseLabel(next.phase));
+      const whose = esc(seatName(next.handle));
+      body += `<form method="POST" action="/run"><button type="submit">▶ Run ${label} <span style="opacity:.8">— next up: ${whose}</span></button></form>`;
+    }
   }
 
   return `<!doctype html><html><head><meta charset="utf-8">
@@ -466,6 +646,9 @@ async function renderPage(): Promise<string> {
   .stackbox summary{cursor:pointer;opacity:.75;font-weight:600}
   .stackbox form{margin-top:10px}
   .hint{font-size:.78rem;opacity:.5;margin:-2px 0 10px}
+  .thinking{margin:18px 0;padding:12px 16px;border-radius:12px;background:rgba(100,87,240,.1);
+    border:1px solid rgba(100,87,240,.25);font-size:.95rem}
+  .thinking .dim{opacity:.6;font-size:.82rem}
 </style></head><body>
 <h1>🛰️ The Situation Room</h1>
 <div class="sub">Claub · Clem · Kim — drop something heavy, they work it. Not a test. Nobody's graded.</div>
@@ -611,11 +794,43 @@ a{color:#7a6ff0}h2{font-size:1.15rem}.doctext p{margin:0 0 12px}</style></head><
       return new Response("ok", { status: 200 });
     }
 
+    // Fire the next seat and return immediately. The page's auto-tick drives the
+    // rest. No long wait, no browser timeout, no matter how slow the brother is.
     if (req.method === "POST" && url.pathname === "/run") {
-      const result = await runNextPass(url.origin);
+      await ensureTables();
+      const s = await activeSession();
+      let result: any = { started: false, reason: "nothing on the table yet" };
+      if (s) result = await startNextSeat(s, url.origin);
       const ctype = req.headers.get("content-type") ?? "";
       if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
       return new Response(JSON.stringify(result), { headers: { "content-type": "application/json" } });
+    }
+
+    // Poll the in-flight seat once. If it landed, append its line and fire the
+    // next seat of the SAME round (so one /run click rolls the whole round). The
+    // page calls this every few seconds while a seat is thinking.
+    if ((req.method === "POST" || req.method === "GET") && url.pathname === "/tick") {
+      await ensureTables();
+      const s = await activeSession();
+      const json = (o: any) => new Response(JSON.stringify(o), { headers: { "content-type": "application/json" } });
+      if (!s) return json({ status: "idle" });
+      const pending = await getPending(s.id);
+      if (!pending) return json({ status: "idle" });
+      const { done, text } = await pollTaskOnce(pending.task_id);
+      if (!done) return json({ status: "thinking", handle: seatName(pending.handle), phase: pending.phase });
+      // Landed. Append the line (guarding against a duplicate for this seat/phase).
+      const existing = await linesFor(s.id, pending.phase);
+      const already = existing.some((l) => l.speaker === seatName(pending.handle));
+      if (text && !already) await addLine(s.id, pending.phase, seatName(pending.handle), text);
+      await deletePending(pending.id);
+      if (!text) return json({ status: "failed", handle: seatName(pending.handle) });
+      // Auto-continue only within the same phase, so a new round never starts itself.
+      const next = await nextSeatToRun(s.id);
+      if (next.phase === pending.phase) {
+        const r = await startNextSeat(s, url.origin);
+        return json({ status: "advanced", added: seatName(pending.handle), next: r.handle ?? null });
+      }
+      return json({ status: "completed", added: seatName(pending.handle) });
     }
 
     return new Response("not found", { status: 404 });
