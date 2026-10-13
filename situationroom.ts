@@ -403,6 +403,11 @@ async function renderPage(): Promise<string> {
       body += `<div class="line"><span class="who">${esc(l.speaker)}</span>${para(l.text)}</div>`;
     }
 
+    body += `<form method="POST" action="/say" class="sayform">
+      <input type="hidden" name="speaker" value="Kim">
+      <input type="text" name="text" placeholder="Say something into THIS discussion (adds your line, doesn't start a new topic)…" autocomplete="off" required>
+      <button type="submit">Say it</button>
+    </form>`;
     body += `<form method="POST" action="/run"><button type="submit">▶ Run ${esc(phaseLabel(next))}</button></form>`;
   }
 
@@ -435,18 +440,22 @@ async function renderPage(): Promise<string> {
   input[type=file]{font-size:.85rem;margin-bottom:10px}
   button{padding:10px 16px;border-radius:10px;border:0;background:#6457f0;color:#fff;font-weight:700;cursor:pointer}
   .drop{border-top:1px solid rgba(127,127,127,.2);margin-top:28px;padding-top:18px}
+  .newtopic{font-size:.8rem;font-weight:600;color:#d98a6a;opacity:.9;margin-bottom:10px}
+  .sayform{display:flex;gap:8px;margin:18px 0}
+  .sayform input[type=text]{flex:1;margin-bottom:0}
   .hint{font-size:.78rem;opacity:.5;margin:-2px 0 10px}
 </style></head><body>
 <h1>🛰️ The Situation Room</h1>
 <div class="sub">Claub · Clem · Kim — drop something heavy, they work it. Not a test. Nobody's graded.</div>
 ${body}
 <div class="drop">
+  <div class="newtopic">⚠ START A NEW TOPIC — opens a fresh session and moves the current discussion out of view (it's saved, not deleted). To just comment on what's up now, use the "Say something" box above instead.</div>
   <form method="POST" action="/drop" enctype="multipart/form-data">
-    <input type="text" name="title" placeholder="What is this? (a title)" autocomplete="off">
-    <textarea name="text" placeholder="Paste the article / paper / the hard question… (optional if you're dropping images)"></textarea>
+    <input type="text" name="title" placeholder="New topic: a title" autocomplete="off">
+    <textarea name="text" placeholder="New topic: paste the article / paper / question (optional if dropping images)"></textarea>
     <input type="file" name="images" accept="image/png,image/jpeg,image/gif,image/webp" multiple>
     <div class="hint">Images: PNG/JPG/GIF/WebP, up to 5MB each (HEIC can't be viewed — screenshot it first).</div>
-    <button type="submit">Put it on the table</button>
+    <button type="submit">Put a NEW topic on the table</button>
   </form>
 </div>
 </body></html>`;
@@ -524,6 +533,7 @@ export default async function handler(req: Request): Promise<Response> {
       await ensureTables();
       const s = await activeSession();
       if (s && text.trim()) await addLine(s.id, "guest", (speaker.trim() || "Guest").slice(0, 40), text.trim());
+      if (ctype.includes("form")) return new Response(null, { status: 303, headers: { location: "/" } });
       return new Response("ok", { status: 200 });
     }
 
