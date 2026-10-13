@@ -389,7 +389,19 @@ async function renderPage(): Promise<string> {
     const thumbs = imgs.length
       ? `<div class="thumbs">${imgs.map((i) => `<a href="/img/${esc(i.key)}" target="_blank"><img src="/img/${esc(i.key)}" alt="table image" loading="lazy"></a>`).join("")}</div>`
       : "";
-    const docText = s.document ? `<details><summary>show the document</summary><div class="doctext">${para(s.document)}</div></details>` : "";
+    // Keep the room light: a short inline preview, full text on its own /doc
+    // page. Inlining a whole paper (hundreds of <p> nodes) is what was choking
+    // the browser on load. Small docs still render inline in full.
+    let docText = "";
+    if (s.document) {
+      if (s.document.length <= 8000) {
+        docText = `<details><summary>show the document</summary><div class="doctext">${para(s.document)}</div></details>`;
+      } else {
+        const preview = esc(s.document.slice(0, 1200));
+        docText = `<div class="doctext"><p>${preview.replace(/\n/g, " ")}…</p></div>` +
+          `<p><a href="/doc">→ open the full document (${s.document.length.toLocaleString()} chars)</a></p>`;
+      }
+    }
     body += `<div class="doc"><div class="doclabel">ON THE TABLE</div><h2>${esc(s.title || "(untitled)")}</h2>${docText}${thumbs}</div>`;
 
     // Chronological transcript — a header whenever the phase changes, so passes,
@@ -497,6 +509,28 @@ export default async function handler(req: Request): Promise<Response> {
       } catch {
         return new Response("not found", { status: 404 });
       }
+    }
+
+    // The full document on its own page, so the main room stays light. A big
+    // paper (the GWS body is ~207K chars) rendered inline would build hundreds
+    // of DOM nodes on every room load and choke a phone browser; here it only
+    // loads when Kim actually opens the paper.
+    if (req.method === "GET" && url.pathname === "/doc") {
+      const s = await activeSession();
+      const doc = s?.document ?? "";
+      const page = `<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(s?.title || "Document")}</title>
+<style>body{font-family:-apple-system,system-ui,sans-serif;max-width:720px;margin:0 auto;padding:20px;
+background:#faf8f4;color:#1a1a1a;line-height:1.55}
+@media(prefers-color-scheme:dark){body{background:#14130f;color:#eee}}
+a{color:#7a6ff0}h2{font-size:1.15rem}.doctext p{margin:0 0 12px}</style></head><body>
+<p><a href="/">← back to the room</a></p>
+<h2>${esc(s?.title || "(untitled)")}</h2>
+<div class="doctext">${doc ? para(doc) : "<p>(no document)</p>"}</div>
+<p><a href="/">← back to the room</a></p>
+</body></html>`;
+      return new Response(page, { headers: { "content-type": "text/html; charset=utf-8" } });
     }
 
     if (req.method === "GET") {
